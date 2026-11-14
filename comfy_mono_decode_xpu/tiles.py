@@ -41,6 +41,32 @@ def _storage_bytes(tensors):
     return sum(storage.values())
 
 
+def _inactive_vram_budget(device):
+    """Count inactive VBAR pages only when native Torch allocations can reclaim them."""
+    try:
+        from comfy_aimdo import control
+        mode, stats = control.get_xpu_allocator_mode, control.get_xpu_ur_hook_stats
+    except (ImportError, AttributeError):
+        return 0
+    if mode() != "native_hook" or not stats().get("tracked_alloc_calls", 0):
+        return 0
+    import comfy.model_management as mm
+    active = _session["model"]
+    inactive, protected = {}, set()
+    for loaded in mm.current_loaded_models:
+        patcher = loaded.model
+        if loaded.device != device or not patcher.is_dynamic():
+            continue
+        vbar = getattr(patcher.model, "dynamic_vbars", {}).get(device)
+        if vbar is None:
+            continue
+        if loaded.currently_used or any(module is active for module in patcher.model.modules()):
+            protected.add(id(vbar))
+        else:
+            inactive[id(vbar)] = vbar
+    return sum(vbar.loaded_size() for key, vbar in inactive.items() if key not in protected)
+
+
 def _copy_budget(device):
     """Choose after prefill, from actual packed weights and the live allocator pool."""
     import comfy.model_management as mm
@@ -69,11 +95,12 @@ def _copy_budget(device):
     free = torch.xpu.mem_get_info(device)[0]
     reserve = mm.minimum_inference_memory()
     model_bytes, copy_bytes = _storage_bytes(model_tensors), _storage_bytes(copies)
-    available = max(0, min(total - reserved - reserve - model_bytes, free - reserve - _margin))
+    reclaimable = _inactive_vram_budget(device) if dynamic else 0
+    available = max(0, min(total - reserved - reserve - model_bytes, free + reclaimable - reserve - _margin))
     return dict(layout="tile" if copy_bytes <= available else "row", copy_bytes=copy_bytes,
                 available_bytes=available, capacity_bytes=total, reserved_bytes=reserved,
                 inference_reserve_bytes=reserve, model_residency_budget_bytes=model_bytes,
-                dynamic_vram=dynamic)
+                dynamic_vram=dynamic, inactive_vbar_bytes=reclaimable, physical_free_bytes=free)
 
 
 def begin(model):

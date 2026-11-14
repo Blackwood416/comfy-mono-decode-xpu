@@ -217,6 +217,11 @@ top_k 0 / 7 / 20 / 64, top-p, min-p). The tail of a step goes from 2.16 to about
   prefill from actual weight storage and the live allocator/inference budget, including VBAR
   residency outside Torch. Component copies and graph/weight caches are dropped on success,
   cancellation or failure; the global allocator pool is kept.
+- With an observed AIMDO native allocation hook, the copy budget may include resident VBAR pages
+  of inactive models on the same device. It excludes the current transformer and in-use models,
+  counts each VBAR once, and retains the full current-model, allocator and inference reserves.
+  Copies use ordinary Torch allocation; the existing hook reclaims pages as needed. Without that
+  capability the budget uses physical free memory. No model is explicitly unloaded for a copy.
 - Stateful dispatch is an error-recovery boundary: once KV, recurrent state or x may have been
   written, the wrapper propagates errors instead of replaying the layer. Only pure operations may
   retry the stock path after disabling their accelerated route.
