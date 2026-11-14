@@ -122,6 +122,7 @@ struct Stream {
     int64_t tiles;     // total tiles over all matrices
     int ksplit;        // K chunks per tile (power of two)
     bool tiled;        // tile-major W4 copy (resident weights) or the checkpoint's row-major layout
+    bool cyclic = false; // interleave output tiles across resident work-groups
     int pblock;        // PAIR: tiles per work-group block; a block lists its gate tiles, then its up tiles
 };
 
@@ -183,7 +184,12 @@ inline void stream_gemv_impl(sycl::nd_item<1>& it, const int8_t* xq, const Strea
     // tile-major weights (see the W4 layout note): a sub-group's K32 step is one contiguous 256 B block
     auto tile_of = [&](int u, int& which) {
         int tile;
-        which = stream_which(st, t0 + (u >> kl2), tile);
+        int g = t0 + (u >> kl2);
+        if (st.cyclic) {
+            const int local = u >> kl2, nw = it.get_group_range(0), wg = it.get_group(0);
+            g = st.pair ? (((local >> 1) * nw + wg) * 2 + (local & 1)) : (local * nw + wg);
+        }
+        which = stream_which(st, g, tile);
         return int64_t(tile);
     };
     auto wptr = [&](int lu, int ls) {

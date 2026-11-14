@@ -187,6 +187,9 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     Stream SG = make_stream(gu, 2, true), SD = make_stream(&D, 1, false);
     stream_finalize(SG, NW);
     SO.tiled = SG.tiled = SD.tiled = tiled;
+    SO.cyclic = tiled && SO.tiles % NW == 0;
+    SG.cyclic = tiled && (SG.tiles / 2) % NW == 0;
+    SD.cyclic = tiled && SD.tiles % NW == 0;
     {
         int64_t a0, a1;
         stream_range(SO, 0, NW, a0, a1);
@@ -272,7 +275,8 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
                     for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
                         const int e2 = i % 128, r = e2 / 16;
                         if (r >= R) continue;
-                        const int64_t n = (t0 + i / 128) * 16 + e2 % 16;
+                        const int64_t tile = i / 128;
+                        const int64_t n = (SO.cyclic ? tile * NW + wg : t0 + tile) * 16 + e2 % 16;
                         x1p[r * 4096 + n] = bf16_add(xp[r * 4096 + n], scaleback(acc[i], sp[r], O.sc[n]));
                     }
                 }
@@ -293,7 +297,7 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
                         const int64_t tl = i / 128;
                         const int e2 = i % 128, r = e2 / 16;
                         if (r >= R) continue;
-                        const int64_t n = (t0 / 2 + tl) * 16 + e2 % 16;
+                        const int64_t n = (SG.cyclic ? tl * NW + wg : t0 / 2 + tl) * 16 + e2 % 16;
                         const bf16 g = scaleback(acc[(2 * tl) * 128 + e2], sp[8 + r], G.sc[n]);
                         const bf16 u = scaleback(acc[(2 * tl + 1) * 128 + e2], sp[8 + r], U.sc[n]);
                         hb[r * N1 + n] = bf16_mul(lut[sycl::bit_cast<uint16_t>(g)], u);
@@ -314,7 +318,8 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
                     for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
                         const int e2 = i % 128, r = e2 / 16;
                         if (r >= R) continue;
-                        const int64_t n = (t0 + i / 128) * 16 + e2 % 16;
+                        const int64_t tile = i / 128;
+                        const int64_t n = (SD.cyclic ? tile * NW + wg : t0 + tile) * 16 + e2 % 16;
                         xp[r * 4096 + n] = bf16_add(x1p[r * 4096 + n], scaleback(acc[i], sp[16 + r], D.sc[n]));
                     }
                 }

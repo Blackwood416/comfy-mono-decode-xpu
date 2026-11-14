@@ -38,6 +38,10 @@ keeping every output bit unchanged.
   reference kernel's.
 - Tile-major layout `[N/16][K/block][16][block]` gives each lane wide, coalesced loads. Row-major
   weights, as DynamicVRAM hands them over, use the same engine with 4× wider per-lane loads.
+- In `layer_post`, evenly divisible tile-major streams distribute consecutive output tiles across
+  work-groups. Gate/up pairs stay together, and the output stores use the same mapping. Row-major
+  streams and uneven partitions retain contiguous ownership; neither layout changes its bytes or
+  integer accumulation order within a K chunk.
 
 ### Persistent layer kernels
 
@@ -84,6 +88,11 @@ keeping every output bit unchanged.
     27 / 50 / 90 us (`attn_core` verify 91 / 230 / 448 us, draft 35 / 59 / 113 us; Kitchen verify
     273 / 484 / 843 us). Not helpful: cooperative K / V staging in SLM per tile (the staging stores
     cost more than the shared loads saved), S^T = K Q^T with Q^T from SLM.
+  - A uniform check before the context loop selects full cache loads when the prefix fits below
+    the capacity's aligned boundary. Prefix masking still handles a partial last prefix tile. A
+    separate general loop retains zero staging for an actual partial capacity tile. The explicit
+    loops avoid putting matrix accumulators through a shared tile-step lambda, which was slower
+    in the development comparison.
 - `attn_core` (with `MONO_DECODE_XPU_ATTN_DPAS=0`) keeps Kitchen's split-K structure (up to 32 splits of the cache capacity, 64-key
   tiles, per-split online softmax, then combine and tree merge), which fixes every row's rounding.
   Two scheduling choices change only which work-group runs what:
