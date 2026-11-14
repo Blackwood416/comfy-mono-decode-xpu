@@ -60,5 +60,10 @@ third-party sources. Those sources and their licenses are listed below.
 - `csrc/sampling.sycl` follows the small-row FP32 softmax reduction and loop-scan
   arithmetic in `src/ATen/native/xpu/sycl/SoftMaxKernels.cpp` and `ScanUtils.h`
   at `7a617719077a9bdc1515661f2dd8b2af5cc26b2f` of the same Intel repository.
-  The exponential RNG remains a Torch operation; no generator implementation is
-  copied into this project.
+  The fused RNG path also follows `DistributionTemplates.h` and
+  `src/comm/DeviceProperties.h` for the logical Philox mapping and counter increment.
+  Uniform conversion and the exponential boundary follow the installed Torch XPU
+  headers. The Philox rounds come from Torch's shared `ATen/core/PhiloxRNGEngine.h`
+  at installed PyTorch revision `08187d9e0fba026dc8217405802ab5381dc88d90`;
+  that engine is BSD-licensed, with its notice in [licenses/PyTorch-BSD.txt](licenses/PyTorch-BSD.txt).
+  Generator state remains owned and reserved by Torch under its generator mutex.

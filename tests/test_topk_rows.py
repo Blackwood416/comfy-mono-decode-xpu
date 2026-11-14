@@ -61,9 +61,11 @@ def test_verify_rows_sampling_matches_upstream(C, T, top_k, top_p, min_p):
                                                   torch.Generator(device="xpu").manual_seed(seed))
         assert torch.equal(out, ref)
         fused_generator = torch.Generator(device="xpu").manual_seed(seed)
+        fused_generator.set_offset(seed * 4)
         fused = sampling.fused_sample(C, lg, dict(temperature=T, top_k=top_k, top_p=top_p, min_p=min_p), fused_generator)
         if T == 1.0 and 1 <= top_k <= 64:
             expected_generator = torch.Generator(device="xpu").manual_seed(seed)
+            expected_generator.set_offset(seed * 4)
             expected = llama.BaseGenerate.sample_token(gen, lg.float(), T, top_k, top_p, min_p, 1.0, [], expected_generator)
             assert torch.equal(fused, expected)
             assert torch.equal(fused_generator.get_state(), expected_generator.get_state())
@@ -96,3 +98,18 @@ def test_sampling_cutoff_boundaries(C):
                 expected = (ref / noise).argmax(-1, keepdim=True)
                 out, valid = C.sampling_pick(values, ids, noise, top_p, 0.)
                 assert valid.item() and torch.equal(out, expected), (k, cut, top_p)
+
+
+def test_sampling_rng_validates_before_advancing(C):
+    values = torch.zeros(3, 20, device="xpu")
+    ids = torch.arange(20, device="xpu").expand(3, 20).contiguous()
+    generator = torch.Generator(device="xpu").manual_seed(23)
+    before = generator.get_state().clone()
+    with pytest.raises(RuntimeError, match="top-k indices"):
+        C.sampling_pick_rng(values, ids[:, :-1], generator, .95, 0.)
+    assert torch.equal(before, generator.get_state())
+    cpu_generator = torch.Generator().manual_seed(23)
+    before = cpu_generator.get_state().clone()
+    with pytest.raises(RuntimeError):
+        C.sampling_pick_rng(values, ids, cpu_generator, .95, 0.)
+    assert torch.equal(before, cpu_generator.get_state())

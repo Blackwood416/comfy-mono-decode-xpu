@@ -222,9 +222,12 @@ For temperature 1 and k <= 64, `sampling.sycl` combines min-p/top-p, both softma
 inclusive scan, division by exponential samples, argmax and token-index gather.
 Small-row reductions follow Torch XPU's vector grouping and scan order. FP32
 reciprocals use correctly rounded division: the compiler's default reciprocal
-introduced one-ulp probability differences. Torch still generates the exact
-exponential samples, with the same shape and generator state as multinomial's
-one-sample path. Invalid probability rows fail an asynchronous assertion; the
+introduced one-ulp probability differences. The same Torch Philox stream now supplies the exponential draw directly in
+this launch. Its installed core Philox engine is reused; the logical XPU RNG
+launch geometry and counter advance follow Torch distribution policy, derived
+from public device properties. No separate noise tensor or RNG launch remains.
+The uniform conversion and log(1) exclusion preserve multinomial's one-sample
+exponential path and its generator state. Invalid probability rows fail an asynchronous assertion; the
 wrapper never retries after advancing the generator. Other sampling policies
 retain the upstream implementation. These paths do not change prefill or enable
 the experimental INT4 draft head.

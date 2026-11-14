@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // The small, sorted top-k rows of Qwen3.5 verify sampling. Keep torch's top-k
-// ordering, FP32 softmax reduction and inclusive-scan order; RNG stays with the
-// caller's torch generator. No vocabulary truncation beyond the requested k.
+// ordering, FP32 softmax reduction, inclusive-scan order and Torch generator
+// stream. No vocabulary truncation beyond the requested k.
 #include <cmath>
+#include <mutex>
+#include <algorithm>
+#include <ATen/core/PhiloxRNGEngine.h>
+#include <ATen/xpu/XPUContext.h>
+#include <ATen/xpu/XPUGeneratorImpl.h>
+#include <c10/core/DeviceGuard.h>
 #include <limits>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
@@ -11,7 +17,37 @@
 
 namespace mono_decode_xpu {
 namespace {
+template <bool WITH_RNG>
 class SamplingProbsKernel;
+
+// Torch's logical RNG launch covers every element of these small rows, so
+// each element uses its thread's first rand4 component. Check that geometry
+// before reserving state. Torch offsets are multiples of four 32-bit draws;
+// the shared core Philox engine counts 128-bit blocks. A statically first
+// engine call avoids the generic state-indexed array spilling to scratch.
+inline float sampling_exponential(at::PhiloxXpuState args, int element) {
+    const auto [seed, offset] = at::xpu::philox::unpack(args);
+    at::Philox4_32 engine(seed, uint32_t(element), offset / 4);
+    // Torch XPU's _rand_uniform and ExponentialFunctor<float,float>(1).
+    const float uniform = float(engine()) * 0x1p-32f + 0x1p-33f;
+    return uniform >= 1.f - std::numeric_limits<float>::epsilon() / 2.f
+        ? std::numeric_limits<float>::epsilon() / 2.f : -sycl::log(uniform);
+}
+
+// The installed XPU distribution headers refer to uninstalled comm/ headers.
+// Keep their launch-policy formula here, using public Torch device properties.
+// No device ID or fixed launch width participates in the stream mapping.
+inline std::pair<uint64_t, uint32_t> sampling_rng_policy(int64_t n, int device) {
+    const auto* prop = at::xpu::getDeviceProperties(device);
+    TORCH_CHECK(!prop->sub_group_sizes.empty(), "XPU subgroup sizes unavailable");
+    const int64_t simd = *std::max_element(prop->sub_group_sizes.begin(), prop->sub_group_sizes.end());
+    const int64_t group = simd * prop->gpu_eu_count_per_subslice;
+    const int64_t tile = simd * prop->gpu_eu_count * prop->gpu_hw_threads_per_eu;
+    TORCH_CHECK(group > 0 && tile >= group, "invalid XPU RNG launch geometry");
+    const int64_t groups = std::min((n + group - 1) / group, tile / group);
+    const uint32_t threads = uint32_t(groups * group);
+    return {uint64_t((n - 1) / (int64_t(threads) * 4) + 1) * 4, threads};
+}
 
 // torch XPU's small FP32 softmax uses SIMD16, four adjacent values per lane
 // when k is divisible by four, otherwise one value per lane, strided by 16.
@@ -58,29 +94,46 @@ inline void small_softmax(sycl::sub_group sg, const float* in, float* out, int k
 }
 } // namespace
 
-std::vector<torch::Tensor> sampling_pick(torch::Tensor sorted, torch::Tensor indices, torch::Tensor noise,
-                                       double top_p, double min_p) {
+template <bool WITH_RNG>
+std::vector<torch::Tensor> sampling_pick_impl(torch::Tensor sorted, torch::Tensor indices, torch::Tensor noise,
+                                           double top_p, double min_p, std::optional<at::Generator> generator = std::nullopt) {
     TORCH_CHECK(sorted.is_xpu() && sorted.scalar_type() == at::kFloat && sorted.is_contiguous()
                 && sorted.dim() == 2, "sorted logits: contiguous XPU FP32 [rows, k]");
     const int rows = int(sorted.size(0)), k = int(sorted.size(1));
     TORCH_CHECK(rows >= 1 && rows <= 16 && k >= 1 && k <= 64, "1..16 rows, 1..64 sorted logits");
     TORCH_CHECK(std::isfinite(top_p) && top_p >= 0. && top_p <= 1.
                 && std::isfinite(min_p) && min_p >= 0. && min_p <= 1., "sampling thresholds in [0,1]");
-    TORCH_CHECK(noise.device() == sorted.device() && noise.scalar_type() == at::kFloat && noise.is_contiguous()
+    if constexpr (!WITH_RNG) TORCH_CHECK(noise.device() == sorted.device() && noise.scalar_type() == at::kFloat && noise.is_contiguous()
                 && noise.sizes() == sorted.sizes(), "exponential samples: FP32 with logits shape/device");
     TORCH_CHECK(indices.device() == sorted.device() && indices.scalar_type() == at::kLong && indices.is_contiguous()
                 && indices.sizes() == sorted.sizes(), "top-k indices: INT64 with logits shape/device");
+    const c10::DeviceGuard device_guard(sorted.device());
     auto out = torch::empty({rows, 1}, sorted.options().dtype(at::kLong));
     auto valid = torch::empty({rows}, sorted.options().dtype(at::kBool));
     const float* ip = sorted.data_ptr<float>();
-    const float* qp = noise.data_ptr<float>();
+    const float* qp = WITH_RNG ? nullptr : noise.data_ptr<float>();
     const int64_t* ids = indices.data_ptr<int64_t>();
     int64_t* tokens = out.data_ptr<int64_t>();
     bool* validity = valid.data_ptr<bool>();
     const float tp = float(top_p), mp = float(min_p);
+    at::PhiloxXpuState rng_args;
+    if constexpr (WITH_RNG) {
+        const auto [increment, threads] = sampling_rng_policy(rows * k, sorted.get_device());
+        TORCH_CHECK(threads >= uint32_t(rows * k) && increment == 4,
+                    "small-row RNG requires one first-component draw per logical Torch thread");
+        auto* gen = at::get_generator_or_default<at::XPUGeneratorImpl>(
+            generator, at::xpu::detail::getDefaultXPUGenerator(sorted.get_device()));
+        // XPU generators carry a device type without an ordinal. The Torch
+        // get_generator_or_default type check is the original RNG contract.
+        // Validate/allocate before reserving RNG state. The caller propagates
+        // failures after reservation, never retrying with another draw.
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        rng_args = gen->philox_xpu_state(increment);
+        TORCH_INTERNAL_ASSERT(rng_args.captured_ || rng_args.offset_.val % 4 == 0);
+    }
     c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> logit(64, cgh), prob(64, cgh), scan(64, cgh);
-        cgh.parallel_for<SamplingProbsKernel>(sycl::nd_range<1>(rows * 32, 32),
+        cgh.parallel_for<SamplingProbsKernel<WITH_RNG>>(sycl::nd_range<1>(rows * 32, 32),
                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
 #pragma clang fp contract(off)
             const int t = it.get_local_id(0), row = it.get_group(0);
@@ -132,9 +185,8 @@ std::vector<torch::Tensor> sampling_pick(torch::Tensor sorted, torch::Tensor ind
             sycl::group_barrier(it.get_group());
             {
                 // torch.multinomial(probs, 1) uses an exponential draw and
-                // argmax(probs / draw). The caller generates exactly the same
-                // draw with its torch generator; filter + divide + argmax +
-                // top-k-index gather now share this launch.
+                // argmax(probs / draw). Draws come from the same Torch stream
+                // or the explicit-noise API used for deterministic boundaries.
                 float best = -std::numeric_limits<float>::infinity(), pmax = 0.f;
                 int idx = k, nan_idx = k;
                 bool ok = true;
@@ -142,7 +194,9 @@ std::vector<torch::Tensor> sampling_pick(torch::Tensor sorted, torch::Tensor ind
                     const float p = prob[c];
                     ok = ok && sycl::isfinite(p) && p >= 0.f;
                     pmax = sycl::fmax(pmax, p);
-                    const float v = sycl::ext::intel::math::fdiv_rn(p, qp[row * k + c]);
+                    const float noise_value = WITH_RNG ? sampling_exponential(rng_args, row * k + c)
+                                                       : qp[row * k + c];
+                    const float v = sycl::ext::intel::math::fdiv_rn(p, noise_value);
                     if (sycl::isnan(v)) nan_idx = sycl::min(nan_idx, c);
                     else if (v > best || (v == best && c < idx)) { best = v; idx = c; }
                 }
@@ -159,5 +213,15 @@ std::vector<torch::Tensor> sampling_pick(torch::Tensor sorted, torch::Tensor ind
         });
     });
     return {out, valid};
+}
+
+std::vector<torch::Tensor> sampling_pick(torch::Tensor sorted, torch::Tensor indices, torch::Tensor noise,
+                                       double top_p, double min_p) {
+    return sampling_pick_impl<false>(sorted, indices, noise, top_p, min_p);
+}
+
+std::vector<torch::Tensor> sampling_pick_rng(torch::Tensor sorted, torch::Tensor indices,
+                                           std::optional<at::Generator> generator, double top_p, double min_p) {
+    return sampling_pick_impl<true>(sorted, indices, {}, top_p, min_p, generator);
 }
 } // namespace mono_decode_xpu

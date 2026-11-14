@@ -34,6 +34,8 @@ std::vector<torch::Tensor> fast_pick(torch::Tensor x, int64_t k);
 std::vector<torch::Tensor> topk_rows(torch::Tensor x, int64_t k);
 std::vector<torch::Tensor> sampling_pick(torch::Tensor sorted, torch::Tensor indices, torch::Tensor noise,
                                        double top_p, double min_p);
+std::vector<torch::Tensor> sampling_pick_rng(torch::Tensor sorted, torch::Tensor indices,
+                                           std::optional<at::Generator> generator, double top_p, double min_p);
 std::vector<torch::Tensor> verify_norm_rot_quant(torch::Tensor x, torch::Tensor w, double eps, torch::Tensor h);
 void draft_embed_norm_cat(torch::Tensor token, torch::Tensor q, torch::Tensor s, torch::Tensor hmat, torch::Tensor emb,
                           torch::Tensor hidden, torch::Tensor we, torch::Tensor wh, double eps_e, double eps_h,
@@ -94,6 +96,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fast_pick", &mono_decode_xpu::fast_pick);
     m.def("topk_rows", &mono_decode_xpu::topk_rows);
     m.def("sampling_pick", &mono_decode_xpu::sampling_pick);
+    m.def("sampling_pick_rng", &mono_decode_xpu::sampling_pick_rng);
     m.def("verify_norm_rot_quant", &mono_decode_xpu::verify_norm_rot_quant);
     m.def("draft_embed_norm_cat", &mono_decode_xpu::draft_embed_norm_cat);
     m.def("draft_add_rmsnorm", &mono_decode_xpu::draft_add_rmsnorm);
