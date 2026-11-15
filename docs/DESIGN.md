@@ -63,6 +63,23 @@ keeping every output bit unchanged.
   the device capacity before launch; the common path needs no additional capacity query.
   B580's largest attention pack uses at most one chunk per Xe core; explicit chunk hints, smaller
   packs and other devices keep their existing attention scheduling.
+- The pair table (32768 entries) depends only on the codebook. Each launch of `layer_pre`,
+  `layer_gdn` and `layer_post` fills a global copy at its start, one entry per thread over all
+  work-groups, and every GEMV phase loads it into SLM with 16 B moves from L2 (about 1 us). Building it
+  in every work-group took about 3.5 us of ALU work per GEMV phase, on the critical path of the first
+  GEMV of each launch. Same entries, same lookups.
+- `layer_post` time (32 streamed real layers, R = 8, about 203 us a layer; 215 us in the decode
+  profile): the three GEMV streams run at about 566 GB/s, close to the best read pattern measured on
+  B70 (577 GB/s for 1 KB sub-group interleave). The rest is the three row phases (gate, norm and
+  rot_quant on R work-groups, about 7 us each with their barrier, DRAM idle), barrier waits and the
+  tails of the streams. Tried and not kept (bit-identical, slower):
+  - L2 prefetch of the next GEMV's first steps during a row phase: the prefetch traffic queues the
+    row work-groups' own loads and stores (rot_quant of h took 6.3 -> 14.3 us), more than the stream
+    saves (4 us); idle-work-groups-only or delayed prefetch does not avoid it. The same prefetch saves
+    6-10 us in a microbenchmark whose row work does not touch memory.
+  - Staging the row in SLM for rot_quant (with or without bank padding), 16 A fragments in flight,
+    `noinline` row helpers: the GEMV stream loop itself slows (register allocation is shared by the
+    whole kernel; gate/up 100.5 -> 104.7 us with 16 fragments), and stack calls spill.
 - The GDN layer's single fused kernel spilled 1–3 KB per thread at 128 GRF. It is split into a
   core-only kernel (0 spill) plus `layer_post`, which made it faster.
 - `layer_gdn` (the core kernel, P1–P5) keeps every operation of the replaced chain in order; what

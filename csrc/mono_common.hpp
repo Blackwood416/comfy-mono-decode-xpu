@@ -79,33 +79,53 @@ constexpr int TAB = 128 * 256;
 constexpr int ACC = 64 * 128;
 static_assert(MWG == 1024, "pair table build assumes 1024 threads");            // SLM split-K accumulators: up to 64 tiles per work-group           // pair table: [fp8 scale byte < 0x80][two packed codes] -> two INT8 values
 
-// exact pair table for one codebook: entry (s << 8 | byte) holds the INT8-grid values of the low and
-// high nibble codes of `byte` at FP8 scale byte s, computed with the dec4 formula
+// Exact pair table for one codebook: entry (s << 8 | byte) holds the INT8-grid values of the low and
+// high nibble codes of `byte` at FP8 scale byte s, computed with the dec4 formula.
+// One INT8-grid value of the dec4 formula (code value c at FP8 scale `scale`), as an unsigned byte.
+inline uint32_t pair_code(float c, float scale) {
+    const float r = sycl::rint(c * scale);
+    const int32_t q = sycl::isnan(r) ? 0 : static_cast<int32_t>(sycl::clamp(r, -127.f, 127.f));
+    return uint32_t(q & 0xFF);
+}
+
+// The pair table depends only on the codebook. A kernel fills a global copy (TAB uint16) at its start,
+// spread over all its work-groups (one entry per thread), and after the next grid sync every
+// work-group loads it into SLM with 16 B moves from L2: about 0.3 us instead of computing all 32768
+// entries in each work-group (about 3 us, on the critical path of every GEMV phase).
+template <typename CB>
+inline void build_pair_table_global(sycl::nd_item<1>& it, uint16_t* gtab, const CB& cb, uint32_t wg, uint32_t nw) {
+    const int t = it.get_local_id(0);
+    for (int i = int(wg) * MWG + t; i < TAB; i += int(nw) * MWG) {
+        const int byte = i & 255;
+        const float scale = static_cast<float>(sycl::bit_cast<fp8>(uint8_t(i >> 8)));
+        gtab[i] = uint16_t(pair_code(cb[byte & 15], scale) | (pair_code(cb[byte >> 4], scale) << 8));
+    }
+}
+// SLM copy of the global table; the caller barriers before use
+inline void load_pair_table(sycl::nd_item<1>& it, LPtrU16 tab, const uint16_t* gtab) {
+    const int t = it.get_local_id(0);
+    const auto* src = reinterpret_cast<const uint32_t*>(gtab);
+    auto* dst = reinterpret_cast<uint32_t*>(tab.get());
+    constexpr int N = TAB / 8 / MWG;  // 16 B moves per thread
+    sycl::vec<uint32_t, 4> v[N];
+#pragma unroll
+    for (int k = 0; k < N; ++k) v[k].load(0, gptr(src + 4 * (t + k * MWG)));
+#pragma unroll
+    for (int k = 0; k < N; ++k) v[k].store(0, lptr(dst + 4 * (t + k * MWG)));
+}
+
+// Each thread owns one byte (t & 255), i.e. a fixed pair of codes, and fills its 32 scale rows
+// (t >> 8) + 4j directly from registers: no staged singles, no SLM gathers, no internal barrier.
+// Every entry is the same dec4 expression as the staged build. The caller barriers before use.
 template <typename CB>
 inline void build_pair_table(sycl::nd_item<1>& it, LPtrU16 tab, const CB& cb) {
-    // singles [128 scale bytes][16 codes] (the dec4 formula), staged in the upper half of the table
-    // region that the pair pass fills last
-    const int t = it.get_local_id(0);
-    auto single = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-        reinterpret_cast<uint8_t*>(tab.get()) + 2 * TAB - 2048);
-    for (int i = t; i < 2048; i += MWG) {
-        const float scale = static_cast<float>(sycl::bit_cast<fp8>(uint8_t(i >> 4)));
-        const float r = sycl::rint(cb[i & 15] * scale);
-        const int32_t q = sycl::isnan(r) ? 0 : static_cast<int32_t>(sycl::clamp(r, -127.f, 127.f));
-        single[i] = static_cast<uint8_t>(q & 0xFF);
+    const int t = it.get_local_id(0), byte = t & 255;
+    const float clo = cb[byte & 15], chi = cb[byte >> 4];
+#pragma unroll 4
+    for (int s = t >> 8; s < 128; s += MWG / 256) {
+        const float scale = static_cast<float>(sycl::bit_cast<fp8>(uint8_t(s)));
+        tab[(s << 8) | byte] = uint16_t(pair_code(clo, scale) | (pair_code(chi, scale) << 8));
     }
-    sycl::group_barrier(it.get_group());
-    // pairs: entries [0, TAB - 1024) never overlap the singles' bytes; the last 1024 entries are
-    // computed into registers first, then written after a barrier
-    uint16_t tail = 0;
-    for (int i = t; i < TAB; i += MWG) {
-        const int s = i >> 8, byte = i & 255;
-        const uint16_t v = uint16_t(single[s * 16 + (byte & 15)]) | uint16_t(uint16_t(single[s * 16 + (byte >> 4)]) << 8);
-        if (i < TAB - 1024) tab[i] = v;
-        else tail = v;
-    }
-    sycl::group_barrier(it.get_group());
-    if (TAB - 1024 + t < TAB && t < 1024) tab[TAB - 1024 + t] = tail;
 }
 
 // ---- stream GEMV engine ---------------------------------------------------------------------------
