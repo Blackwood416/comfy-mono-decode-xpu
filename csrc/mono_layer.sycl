@@ -33,7 +33,7 @@ W4 w4_of(const torch::Tensor& q, const torch::Tensor& s, const torch::Tensor& sc
 }
 
 struct Scratch {
-    torch::Tensor q1, q2, s, x1, xn, yb, h, cnt;
+    torch::Tensor q1, q2, s, x1, xn, yb, h, cnt, tab;  // tab: global pair table (TAB uint16), rebuilt by each kernel
 };
 Scratch& scratch(const torch::Tensor& like) {
     static std::map<int, Scratch> cache;
@@ -44,7 +44,8 @@ Scratch& scratch(const torch::Tensor& like) {
         Scratch sc{torch::zeros({8, MAXK}, o.dtype(at::kChar)), torch::zeros({8, MAXK}, o.dtype(at::kChar)),
                    torch::zeros({32}, o.dtype(at::kFloat)), torch::zeros({8, 4096}, o.dtype(at::kBFloat16)),
                    torch::zeros({8, 4096}, o.dtype(at::kBFloat16)), torch::zeros({8, 4096}, o.dtype(at::kBFloat16)),
-                   torch::zeros({8, MAXK}, o.dtype(at::kBFloat16)), torch::zeros({2}, o.dtype(at::kInt))};
+                   torch::zeros({8, MAXK}, o.dtype(at::kBFloat16)), torch::zeros({2}, o.dtype(at::kInt)),
+                   torch::zeros({TAB}, o.dtype(at::kShort))};
         found = cache.emplace(dev, sc).first;
     }
     return found->second;
@@ -115,6 +116,7 @@ std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, doub
     auto* q1p = S.q1.data_ptr<int8_t>();
     auto* sp = S.s.data_ptr<float>();
     auto* cnt = reinterpret_cast<uint32_t*>(S.cnt.data_ptr());
+    auto* gtp = reinterpret_cast<uint16_t*>(S.tab.data_ptr());
     const float e = static_cast<float>(eps);
     bf16* o0 = op[0]; bf16* o1 = op[1]; bf16* o2 = op[2];
     queue.submit([&](sycl::handler& cgh) {
@@ -122,7 +124,6 @@ std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, doub
         sycl::local_accessor<float, 1> red(MSG, cgh);
         sycl::local_accessor<float, 1> nred(1056, cgh);
         sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
-        sycl::local_accessor<float, 1> cbl(16, cgh);
         cgh.parallel_for<LayerPreKernel>(
             sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int t = it.get_local_id(0);
@@ -133,8 +134,7 @@ std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, doub
                 const LPtrU16 tab = lptr(reinterpret_cast<uint16_t*>(rraw));
                 auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
                 auto lred = lptr(nred.template get_multi_ptr<sycl::access::decorated::no>().get());
-                if (t < 16) cbl[t] = st.m[0].cb[t];
-                const SlmCb cb{cbl, 0};
+                build_pair_table_global(it, gtp, st.m[0].cb, wg, NW);  // complete after the grid sync
                 // ---- phase 1: xn = RMSNorm(x); q = rot_quant(xn) ----
                 for (int64_t r = wg; r < R; r += NW) {
                     rms_norm_row(it, xp + r * 4096, wp, xnp + r * 4096, e, lred);
@@ -144,7 +144,7 @@ std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, doub
                 // ---- phase 2: projections ----
                 int64_t t0, t1;
                 stream_range(st, wg, NW, t0, t1);
-                build_pair_table(it, tab, cb);
+                load_pair_table(it, tab, gtp);
                 for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) acc[i] = 0;
                 sycl::group_barrier(it.get_group());
                 stream_gemv(it, q1p, st, t0, t1, tab, lacc);
@@ -230,6 +230,7 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     auto* ybp = reinterpret_cast<bf16*>(S.yb.data_ptr());
     auto* hb = reinterpret_cast<bf16*>(S.h.data_ptr());
     auto* cnt = reinterpret_cast<uint32_t*>(S.cnt.data_ptr());
+    auto* gtp = reinterpret_cast<uint16_t*>(S.tab.data_ptr());
     const float e = static_cast<float>(eps);
     const int ST = static_cast<int>(stop);
     queue.submit([&](sycl::handler& cgh) {
@@ -237,7 +238,6 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
         sycl::local_accessor<float, 1> red(MSG, cgh);
         sycl::local_accessor<float, 1> nred(1056, cgh);
         sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
-        sycl::local_accessor<float, 1> cbl(16, cgh);
         cgh.parallel_for<LayerPostKernel<CompactH>>(
             sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int t = it.get_local_id(0);
@@ -248,11 +248,12 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
                 const LPtrU16 tab = lptr(reinterpret_cast<uint16_t*>(rraw));
                 auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
                 auto lred = lptr(nred.template get_multi_ptr<sycl::access::decorated::no>().get());
-                if (t < 16) cbl[t] = O.cb[t];  // one codebook for all projections (host-checked)
-                const SlmCb cb{cbl, 0};
+                // one codebook for all projections (host-checked); its pair table is complete after the
+                // first grid sync, and every GEMV phase loads it into SLM (rot_quant reuses that region)
+                build_pair_table_global(it, gtp, O.cb, wg, NW);
                 bool tab_ok = false;
                 auto table = [&]() {
-                    if (!tab_ok) { build_pair_table(it, tab, cb); tab_ok = true; }
+                    if (!tab_ok) { load_pair_table(it, tab, gtp); tab_ok = true; }
                     sycl::group_barrier(it.get_group());
                 };
                 auto gemv = [&](const Stream& st, const int8_t* xq, int64_t& t0, int64_t& t1) {
