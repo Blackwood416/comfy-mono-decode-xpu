@@ -2,6 +2,7 @@
 #include <optional>
 #include <vector>
 #include <torch/extension.h>
+#include "attn_mono.hpp"
 
 namespace mono_decode_xpu {
 torch::Tensor w4a8_decode_linear(torch::Tensor x, torch::Tensor x_scale, torch::Tensor packed,
@@ -79,6 +80,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("layer_gdn_core", &mono_decode_xpu::layer_gdn_core);
     m.def("attn_core", &mono_decode_xpu::attn_core);
     m.def("attn_dpas", &mono_decode_xpu::attn_dpas);
+    py::class_<mono_decode_xpu::AttentionMonoWorkspace,
+               std::shared_ptr<mono_decode_xpu::AttentionMonoWorkspace>>(m, "AttentionMonoWorkspace")
+        .def_readonly("chunks", &mono_decode_xpu::AttentionMonoWorkspace::chunks)
+        .def_readonly("groups", &mono_decode_xpu::AttentionMonoWorkspace::groups);
+    m.def("attention_mono_workspace", &mono_decode_xpu::attention_mono_workspace);
+    m.def("attention_mono", &mono_decode_xpu::attention_mono);
     m.def("mtp_prep_draft", &mono_decode_xpu::mtp_prep_draft);
     m.def("mtp_prep_verify", &mono_decode_xpu::mtp_prep_verify);
     m.def("mtp_accept", &mono_decode_xpu::mtp_accept);

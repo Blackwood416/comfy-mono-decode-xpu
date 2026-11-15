@@ -203,3 +203,40 @@ def test_inference_norm_cache_has_generation_lifetime(monkeypatch):
         assert calls == [1, 1]
     finally:
         tiles.end()
+
+
+def test_fused_attention_respects_wrapped_attend(monkeypatch):
+    """A decorator inherits CLAIM; it must still receive the attention call."""
+    from functools import wraps
+    from types import SimpleNamespace
+    import comfy.model_management as mm
+    from comfy_mono_decode_xpu import layer, _C
+
+    def installed(*args):
+        raise AssertionError("not called by eligibility")
+    setattr(installed, layer.CLAIM, True)
+
+    class Cache:
+        tracker = {"tree": None}
+        key = object()
+
+        @wraps(installed)
+        def attend(self, *args):
+            return installed(*args)
+
+    def forbidden(*args):
+        raise AssertionError("fused native dispatch bypassed custom attend")
+
+    monkeypatch.setattr(layer, "_attend_impl", installed)
+    monkeypatch.setattr(layer, "_attn_port", True)
+    monkeypatch.setattr(layer, "_attn_dpas", True)
+    monkeypatch.setattr(layer.guard, "off", lambda _: False)
+    monkeypatch.setattr(layer.tiles, "session_active", lambda: True)
+    monkeypatch.setattr(layer, "_norm_rope_eligible", lambda *a: True)
+    monkeypatch.setattr(mm, "comfy_kitchen_attention_enabled", lambda: False)
+    monkeypatch.setattr(_C, "attention_mono_workspace", forbidden)
+    mix = SimpleNamespace(comfy_attention=SimpleNamespace(method=None))
+    assert getattr(Cache.attend, layer.CLAIM)
+    rawq = SimpleNamespace(shape=(1, 1, 16, 256), device=torch.device("cpu"))
+    rawk = SimpleNamespace(shape=(1, 1, 4, 256))
+    assert layer._attention_mono(mix, rawq, rawk, None, None, Cache()) is None

@@ -18,6 +18,8 @@ small XPU tensors with controlled failures; they do not load a model.
 Coverage includes the existing numerical comparisons for top-k, RoPE/KV, ConvRot,
 W4A8 linear and both MLP layouts; eligibility checks; and three focused runtime
 regressions (no replay after KV/x writes, and inference-compatible cache lifetime).
+The complete attention cases check normalization/KV state, poisoned future cache rows,
+the existing FP64/Kitchen bound and repeated XPU graph replay with owned scratch.
 On ComfyUI v0.45, two additional cases exercise real combined storage and its residency window,
 then compare the MLP, normalization and projections with the actual combined input-act entry for
 1/3/8 rows. They skip on older ComfyUI versions without that interface.

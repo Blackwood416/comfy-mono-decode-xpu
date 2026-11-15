@@ -9,7 +9,7 @@ whose projections are all packed W4A8 (G16, FP8 group scales, ConvRot 256, one c
         layer_post  out projection + residual + post RMSNorm + MLP + residual             (1 launch)
     full-attention layers (8 of 32)
         layer_pre   input RMSNorm + rotate/quantize + q/k/v projections                   (1 launch)
-        qk_norm_rope_kv (Q/K RMSNorm + partial RoPE + KV write), attn_core (attention port)
+        attention_mono Q/K RMSNorm + RoPE + KV write + DPAS + tree merge           (1 launch)
         layer_post  sigmoid gate + out projection + residual + post RMSNorm + MLP + residual
 
 Also installed here: the attention port for FixedKVCache.attend, the BF16 MTP draft block's attention
@@ -45,12 +45,13 @@ _attn_dpas = os.environ.get("MONO_DECODE_XPU_ATTN_DPAS", "1") == "1"
 _gdn_split = os.environ.get("MONO_DECODE_XPU_GDN_SPLIT", "1") == "1"
 _rope_fused = os.environ.get("MONO_DECODE_XPU_ROPE", "1") == "1"
 _rope_state = {"ok": None}  # fused rope + KV write: None until the one-time check against the live path
+_attend_impl = None  # exact callable installed here; decorators can inherit CLAIM
 
 
 def stats():
     with _lock:
         out = {"layer": _stats["layer"], "gdn1": _stats.get("gdn1", 0), "attn": _stats.get("attn", 0),
-               "attn_dpas": _stats.get("attn_dpas", 0),
+               "attn_dpas": _stats.get("attn_dpas", 0), "attention_mono": _stats.get("attention_mono", 0),
                "rope": _stats.get("rope", 0), "norm_rope": _stats.get("norm_rope", 0),
                "fallback": dict(_stats["fallback"])}
     t = tiles.stats()
@@ -333,6 +334,63 @@ def _rope_write(mix, qn, kn, xv4, freqs, kv):
     return q, k
 
 
+def _attention_mono(mix, rawq, rawk, value_rows, freqs, kv):
+    """The complete decode core, using this generate's graph-stable workspace."""
+    import comfy.model_management as mm
+    from comfy.text_encoders import qwen35 as q35
+    from . import _C
+
+    if (not tiles.session_active() or not _attn_port or not _attn_dpas
+            or any(guard.off(p) for p in ("attn", "attn_dpas", "attention_mono"))
+            or mix.comfy_attention.method is not None or mm.comfy_kitchen_attention_enabled()
+            or not _norm_rope_eligible(mix, rawq, rawk, value_rows, freqs, kv)
+            or "attend" in vars(kv) or type(kv).attend is not _attend_impl):
+        return None
+    rows, heads, kv_heads = rawq.shape[1], rawq.shape[2], rawk.shape[2]
+    if heads % kv_heads or (rows * (heads // kv_heads) + 7) // 8 > 4:
+        return None
+    tree = kv.tracker.get("tree") if isinstance(kv.tracker, dict) else None
+    if tree is not None and tree.mask.numel() == rows and tree.mask.dtype == torch.int32:
+        mask = tree.mask
+    elif tree is None and rows == 1:
+        mask = tiles.cached(("attention_empty_mask", rawq.device),
+                            lambda: torch.empty(0, dtype=torch.int32, device=rawq.device))
+    else:
+        return None
+    workspace = tiles.cached(("attention_mono", id(mix), id(kv), rawq.device, rows),
+                             lambda: _C.attention_mono_workspace(rawq, rawk, kv.key))
+    checked = tiles.cached(("attention_mono_check", id(mix), rawq.device, rows,
+                            id(q35.apply_partial_rope)), lambda: {"ok": False})
+    reference = None
+    if not checked["ok"]:
+        qn, kn = mix.q_norm(rawq), mix.k_norm(rawk)
+        reference = q35.apply_partial_rope(qn.transpose(1, 2), kn.transpose(1, 2), freqs, mix.rotary_dim)
+    try:
+        output, q, k = _C.attention_mono(
+            rawq, rawk, value_rows, _norm_weight(mix.q_norm, rawq.device),
+            _norm_weight(mix.k_norm, rawq.device), freqs.reshape(rows, -1, 2, 2),
+            kv.key, kv.value, kv.position[:rows], kv.seqlen, mask,
+            mix.q_norm.eps, mix.k_norm.eps, mix.rotary_dim, workspace)
+    except Exception as exc:
+        # KV may already be written. Never replay a partially executed native call.
+        guard.failed("attention_mono", exc, can_fallback=False)
+        raise SubpathError("attention_mono") from exc
+    if reference is not None:
+        q = q[:, :rows * (heads // kv_heads)].reshape(1, heads, rows, mix.head_dim)
+        if not (_same(q, reference[0]) and _same(k, reference[1])):
+            # Preserve the existing live-normalizer compatibility check. Rewriting
+            # just these KV slots is safe; no residual/recurrent state has changed.
+            guard.failed("norm_rope", RuntimeError("attention Q/K RMSNorm/RoPE differs from active operators"))
+            _fallback("attention_mono_check")
+            kv.write(reference[1], value_rows.transpose(1, 2))
+            return kv.attend(reference[0], reference[1], value_rows.transpose(1, 2))
+        checked["ok"] = True
+    with _lock:
+        for name in ("attention_mono", "attn_dpas", "norm_rope", "rope"):
+            _stats[name] = _stats.get(name, 0) + 1
+    return output
+
+
 def _attn_core(mix, qg, xk, xv, attention_mask, freqs_cis, optimized_attention, past_key_value):
     # GatedAttention.forward after the projections, up to (not including) the sigmoid gate
     import comfy.model_management
@@ -345,6 +403,10 @@ def _attn_core(mix, qg, xk, xv, attention_mask, freqs_cis, optimized_attention, 
     xv4 = xv.view(B, S, mix.num_kv_heads, mix.head_dim)
     xv = xv4.transpose(1, 2)
     decode = past_key_value is not None and S <= SPEC_ROWS and attention_mask is None
+    if decode:
+        fused = _attention_mono(mix, rawq, rawk, xv4, freqs_cis, past_key_value)
+        if fused is not None:
+            return fused
     if decode and _norm_rope_eligible(mix, rawq, rawk, xv4, freqs_cis, past_key_value):
         xq, xk = _norm_rope_write(mix, rawq, rawk, xv4, freqs_cis, past_key_value)
     else:
@@ -373,6 +435,7 @@ def _attn_core(mix, qg, xk, xv, attention_mask, freqs_cis, optimized_attention, 
 
 def _install_attend():
     """FixedKVCache.attend -> one bit-identical launch (tree verify rows, or the single MTP draft row)."""
+    global _attend_impl
     from comfy.text_encoders import llama
     from . import _C
     cls = llama.FixedKVCache
@@ -415,6 +478,7 @@ def _install_attend():
     setattr(attend, CLAIM, True)
     attend.__wrapped__ = original
     cls.attend = attend
+    _attend_impl = attend
     return True
 
 

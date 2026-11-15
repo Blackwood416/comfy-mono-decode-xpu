@@ -1,0 +1,579 @@
+// SPDX-License-Identifier: Apache-2.0
+// Complete attention core (Q/K normalization, RoPE, KV write, DPAS, tree merge) in one resident grid.
+// Independent projection GEMMs stay in the existing fast layer_pre/layer_post paths.
+#include <cmath>
+#include <type_traits>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <cstdint>
+#include <vector>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+#include "mono_common.hpp"
+#include "attn_mono.hpp"
+namespace mono_decode_xpu {
+namespace {
+using namespace mono;
+constexpr int CWG=256;
+inline void finish(sycl::nd_item<1>& it, uint32_t* cnt, uint32_t NW) {
+    // self-reset of the barrier counter: the last work-group to finish knows nobody polls
+    sycl::group_barrier(it.get_group());
+    if (it.get_local_id(0) == 0) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> done(cnt[1]), c0(cnt[0]);
+        if (done.fetch_add(1u) == NW - 1) { c0.store(0u); done.store(0u); }
+    }
+}
+
+inline float norm_sum32(sycl::sub_group sg, float lo, float hi) {
+    float sum = lo + hi;
+    for (int offset = 8; offset; offset /= 2)
+        sum = sum + sycl::shift_group_left(sg, sum, offset);
+    return sycl::group_broadcast(sg, sum, 0);
+}
+
+inline float norm_hw_rsqrt(float x) {
+#if defined(__SYCL_DEVICE_ONLY__)
+    float result;
+    __asm__ volatile("rsqrt (M1, 16) %0(0,0)<1> %1(0,0)<1;1,0>" : "=rw"(result) : "rw"(x));
+    return result;
+#else
+    return x;
+#endif
+}
+
+// z is a runtime 0: the XOR keeps IGC from fusing b * fb into the add (it contracts mul+add into mad
+// even with contract(off)), so both products round on their own as in the live omni rotary kernel.
+inline float rope_pair(float a, float fa, float b, float fb, uint32_t z) {
+#pragma clang fp contract(off)
+    const float o = a * fa;
+    const float p = sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(b * fb) ^ z);
+    const float q = sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(o) ^ z);
+    return q + p;
+}
+
+inline void norms_rope(sycl::nd_item<1>& it,const bf16* qp,const bf16* kp,const bf16* vp,
+                      const bf16* qw,const bf16* kw,const float* fp,const int64_t* pp,
+                      bf16* oq,uint32_t* QA,bf16* ok,bf16* kc,bf16* vc,int R,int Hq,int Hk,int pad,int cap,
+                      int rd,float eq,float ek,int64_t qs,int64_t ks,int64_t vs,bool q_torch,int64_t fs,float* sums,bf16* normalized) {
+#pragma clang fp contract(off)
+    const int t=it.get_local_id(0), team=t/128, tt=t%128,sgi=tt/16,lane=tt%16;
+    const int nw=it.get_group_range(0),wg=it.get_group(0),heads=Hq+2*Hk,half=rd/2;
+    auto sg=it.get_sub_group();
+    const uint32_t z=uint32_t(rd>>20);
+    float* sm=sums+team*9; bf16* nr=normalized+team*256;
+    // Only padding is initialized: no race with the following real-row stores.
+    for(int i=wg*CWG+t;i<Hk*pad*256;i+=nw*CWG)
+        if(i/256%pad>=R*(Hq/Hk)) oq[i]=bf16(0.f);
+    for(int i=wg*CWG+t;i<Hk*(pad/8)*16*16*4;i+=nw*CWG) {
+        const int r=(i/(16*16*4)%(pad/8))*8+2*(i%4)+(i/4%16)/8;
+        if(r>=R*(Hq/Hk))QA[i]=0;
+    }
+    for(int round=0;round<(R*heads+nw*(CWG/128)-1)/(nw*(CWG/128));++round) {
+        const int task=round*nw*(CWG/128)+wg+nw*team;
+        const int s=task/heads,h=task%heads;
+        const bool live=task<R*heads, isq=h<Hq, isv=h>=Hq+Hk;
+        const int hh=isq?h:(isv?h-Hq-Hk:h-Hq);
+        if(live&&isv)
+            for(int d=tt;d<256;d+=128) vc[(int64_t(hh)*cap+pp[s])*256+d]=vp[int64_t(s)*vs+hh*256+d];
+        const bf16* src=(isq?qp:kp)+(isq?int64_t(s)*qs+hh*512:int64_t(s)*ks+hh*256);
+        const bf16* weight=isq?qw:kw;
+        if(live&&!isv) {
+            if(isq&&q_torch) {
+                if(sgi<2) {
+                    float lo=0.f,hi=0.f;
+                    for(int j=0;j<4;++j) {
+                        const float a=float(src[sgi*128+lane*4+j]);
+                        const float b=float(src[sgi*128+(lane+16)*4+j]);
+                        lo=sycl::fma(a,a,lo); hi=sycl::fma(b,b,hi);
+                    }
+                    // All lanes must execute the subgroup collective.
+                    const float sum=norm_sum32(sg,lo,hi); if(lane==0) sm[sgi]=sum;
+                }
+            } else {
+                const float a=float(src[sgi*32+lane]),b=float(src[sgi*32+lane+16]);
+                const float sum=norm_sum32(sg,a*a,b*b)*(1.f/256.f);
+                if(lane==0) sm[sgi]=sum;
+            }
+        }
+        sycl::group_barrier(it.get_group());
+        if(live&&!isv) {
+            if(isq&&q_torch&&sgi==0&&lane==0) sm[8]=sycl::rsqrt((sm[0]+sm[1])*(1.f/256.f)+eq);
+            if((!isq||!q_torch)&&sgi==0) {
+                float sum=lane<8?sm[lane]:0.f;
+                for(int off=4;off;off/=2) sum=sum+sycl::shift_group_left(sg,sum,off);
+                if(lane==0) sm[8]=norm_hw_rsqrt(sum+(isq?eq:ek));
+            }
+        }
+        sycl::group_barrier(it.get_group());
+        if(live&&!isv) for(int d=tt;d<256;d+=128) nr[d]=bf16((float(src[d])*sm[8])*float(weight[d]));
+        sycl::group_barrier(it.get_group());
+        if(live&&!isv) for(int d=tt;d<256;d+=128) {
+            bf16 result=nr[d];
+            if(d<rd) {
+                const int j=d<half?d:d-half; const float* f=fp+s*fs+j*4;
+                const float lo=float(nr[j]),hi=float(nr[j+half]);
+                result=bf16(d<half?rope_pair(lo,f[0],hi,f[1],z):rope_pair(hi,f[3],lo,f[2],z));
+            }
+            if(isq) {
+                const int khh=hh/(Hq/Hk),r=(hh%(Hq/Hk))*R+s;
+                oq[(int64_t(khh)*pad+r)*256+d]=result;
+                const uint32_t bits=sycl::bit_cast<uint16_t>(result);
+                const uint32_t next=sycl::shift_group_left(sg,bits,1);
+                if((d&1)==0) {
+                    const int al=(r&1)*8+(d&15)/2,j=(r%8)/2;
+                    QA[((((int64_t(khh)*(pad/8)+r/8)*16+d/16)*16+al)*4+j)]=bits|(next<<16);
+                }
+            }
+            else {ok[(int64_t(hh)*R+s)*256+d]=result;kc[(int64_t(hh)*cap+pp[s])*256+d]=result;}
+        }
+        sycl::group_barrier(it.get_group());
+    }
+}
+
+namespace ad {
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+using bf16 = mono::bf16;
+constexpr int HD=256, TT=16, HALF=128, NT=8;
+constexpr float SCALE=0.0625f*0x1.715476p0f; // log2(e): vLLM native exp2 score domain
+template<class T> inline auto gp(T* p) { return mono::gptr(p); }
+template<class T> inline auto lp(T* p) { return mono::lptr(p); }
+inline void chunking(int L, int chunks, int& per, int& active) {
+    per=sycl::max(32,(L+chunks-1)/chunks); per=(per+15)/16*16;
+    active=L>0?(L+per-1)/per:0;
+}
+// BF16 DPAS and native K-transpose/V-transform adapted from vllm-project/vllm-xpu-kernels
+// ed2071db7c4809aab3dc9a320b31c92ad582906a, mono_layers.hpp (Apache-2.0).
+using half=sycl::half;
+constexpr int KROW=256; // separate contiguous K/V cache rows, not the source combined K|V row
+typedef float v8f __attribute__((ext_vector_type(8)));
+typedef unsigned int v8u __attribute__((ext_vector_type(8)));
+typedef unsigned int v4u __attribute__((ext_vector_type(4)));
+typedef int v2i __attribute__((ext_vector_type(2)));
+#ifdef __SYCL_DEVICE_ONLY__
+extern "C" SYCL_EXTERNAL v8u
+__builtin_IB_subgroup_block_read_flat_transpose_u32_k8(
+    intptr_t base, int width_m1, int height_m1, int pitch_m1, v2i xy);
+extern "C" SYCL_EXTERNAL v8u
+__builtin_IB_subgroup_block_read_flat_transform_u16_k16(
+    intptr_t base, int width_m1, int height_m1, int pitch_m1, v2i xy);
+#endif
+// d[8 rows x 16 cols] (lane = column, element i = row i) += a[8 x 16 half] .
+// b[16 x 16 half]
+//   a: dpas A layout, lane l element j = (A[2j + l/8][2(l%8)], A[2j +
+//   l/8][2(l%8) + 1]) b: VNNI, lane n element p = (B[2p][n], B[2p + 1][n])
+inline void dpas_hf(v8f& d, const v4u& a, const v8u& b) {
+#ifdef __SYCL_DEVICE_ONLY__
+  asm("{\n"
+      ".decl DST     v_type=G type=f num_elts=128 alias=<%0,0>\n"
+      ".decl SRC1_UD v_type=G type=UD num_elts=128 alias=<%2,0>\n"
+      ".decl SRC2_UD v_type=G type=UD num_elts=64 alias=<%1,0>\n"
+      "dpas.hf.hf.8.8 (M1, 16) DST.0 DST.0 SRC1_UD.0 SRC2_UD(0,0)\n"
+      "}\n"
+      : "+rw"(d)
+      : "rw"(a), "rw"(b));
+#else
+  (void)d;
+  (void)a;
+  (void)b;
+#endif
+}
+// the same for DT operands (attention: q, P, K and V in the KV cache dtype)
+template <typename DT>
+inline void dpas16(v8f& d, const v4u& a, const v8u& b) {
+  if constexpr (std::is_same_v<DT, half>) {
+    dpas_hf(d, a, b);
+  } else {
+#ifdef __SYCL_DEVICE_ONLY__
+    asm("{\n"
+        ".decl DST     v_type=G type=f num_elts=128 alias=<%0,0>\n"
+        ".decl SRC1_UD v_type=G type=UD num_elts=128 alias=<%2,0>\n"
+        ".decl SRC2_UD v_type=G type=UD num_elts=64 alias=<%1,0>\n"
+        "dpas.bf.bf.8.8 (M1, 16) DST.0 DST.0 SRC1_UD.0 SRC2_UD(0,0)\n"
+        "}\n"
+        : "+rw"(d)
+        : "rw"(a), "rw"(b));
+#else
+    (void)d;
+    (void)a;
+    (void)b;
+#endif
+  }
+}
+// K tile: 16 token rows x 16 dims at dims dw*2.. (dw in dwords) -> VNNI B of
+// K^T (lane = token)
+inline v8u load_k_tile(const void* row0, int dw) {
+#ifdef __SYCL_DEVICE_ONLY__
+  return __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(
+      (intptr_t)row0, HD * 2 - 1, 15, KROW * 2 - 1, v2i{dw, 0});
+#else
+  (void)row0;
+  (void)dw;
+  return v8u{};
+#endif
+}
+// V tile: 16 token rows x 16 dims (VNNI-transformed) of a 128-dim half
+inline v8u load_v_tile(const void* row0, int col) {
+#ifdef __SYCL_DEVICE_ONLY__
+  return __builtin_IB_subgroup_block_read_flat_transform_u16_k16(
+      (intptr_t)row0, 128 * 2 - 1, 15, KROW * 2 - 1, v2i{col, 0});
+#else
+  (void)row0;
+  (void)col;
+  return v8u{};
+#endif
+}
+template<int NMT>
+inline void partial(sycl::nd_item<1>& it,const uint32_t* QA,const bf16* Kc,const bf16* Vc,
+                    const int* lens,int HK,int cap,int chunks,float* part,float* ml,bf16*) {
+    auto sg=it.get_sub_group();const int lane=sg.get_local_id()[0],sgi=sg.get_group_id()[0],nw=it.get_group_range(0),wg=it.get_group(0);
+    const int L=sycl::min(cap,sycl::max(0,lens[0]));int per,active;chunking(L,chunks,per,active);
+    for(int job=wg+nw*sgi;job<HK*chunks*NMT*2;job+=nw*(CWG/16)) {
+        const int dh=job%2,mt=job/2%NMT,c=job/(2*NMT)%chunks,kh=job/(2*NMT*chunks);
+        if(c>=active)continue;
+        const int beg=c*per,end=sycl::min(L,beg+per);
+        const bf16* kb=Kc+int64_t(kh)*cap*256;const bf16* vb=Vc+int64_t(kh)*cap*256;
+        const uint32_t* qa=QA+(int64_t(kh)*NMT+mt)*16*16*4;
+        v8f O[8];for(int n=0;n<8;++n)O[n]=v8f(0.f);
+        // vLLM MONO_ATTN_STEP(NT=4): one online-softmax update per64 tokens,
+        // lane-local denominators, reduced once after the prefix. Preserve FP32
+        // partial outputs and Comfy arbitrary tree merge; do not mutate tail V.
+        v8f maximum,denominator;
+#pragma unroll
+        for(int i=0;i<8;++i){maximum[i]=-INFINITY;denominator[i]=0.f;}
+#define CORE_MONO_STEP(NTILES,FULL) do { \
+            v8f scores[NTILES]; \
+_Pragma("unroll") \
+            for(int tt=0;tt<NTILES;++tt) { \
+                scores[tt]=v8f(0.f);const int token=tb+tt*16; \
+_Pragma("unroll") \
+                for(int dc=0;dc<16;++dc) { \
+                    v8u bk; \
+                    if((FULL)||token+16<=cap)bk=load_k_tile(kb+int64_t(token)*256,dc*8); \
+                    else { \
+_Pragma("unroll") \
+                        for(int e=0;e<8;++e) { \
+                            const uint16_t a=token+lane<cap?sycl::bit_cast<uint16_t>(kb[int64_t(token+lane)*256+dc*16+2*e]):0; \
+                            const uint16_t b=token+lane<cap?sycl::bit_cast<uint16_t>(kb[int64_t(token+lane)*256+dc*16+2*e+1]):0; \
+                            bk[e]=uint32_t(a)|(uint32_t(b)<<16); \
+                        } \
+                    } \
+                    const v4u q=*reinterpret_cast<const v4u*>(qa+(dc*16+lane)*4); \
+                    dpas16<bf16>(scores[tt],q,bk); \
+                } \
+_Pragma("unroll") \
+                for(int i=0;i<8;++i)scores[tt][i]=((FULL)||token+lane<end)?scores[tt][i]*SCALE:-INFINITY; \
+            } \
+            v8f alpha; \
+_Pragma("unroll") \
+            for(int i=0;i<8;++i) { \
+                float local=scores[0][i]; \
+_Pragma("unroll") \
+                for(int tt=1;tt<NTILES;++tt)local=sycl::fmax(local,scores[tt][i]); \
+                const float mx=sycl::reduce_over_group(sg,local,sycl::maximum<float>()); \
+                const float mn=sycl::fmax(maximum[i],mx); \
+                alpha[i]=maximum[i]==-INFINITY?0.f:sycl::native::exp2(maximum[i]-mn); \
+                maximum[i]=mn;denominator[i]*=alpha[i]; \
+            } \
+_Pragma("unroll") \
+            for(int n=0;n<8;++n) { \
+_Pragma("unroll") \
+                for(int i=0;i<8;++i)O[n][i]*=alpha[i]; \
+            } \
+_Pragma("unroll") \
+            for(int tt=0;tt<NTILES;++tt) { \
+                const int token=tb+tt*16; \
+                uint16_t pv[8]; \
+_Pragma("unroll") \
+                for(int i=0;i<8;++i) { \
+                    const float p=scores[tt][i]==-INFINITY?0.f:sycl::native::exp2(scores[tt][i]-maximum[i]); \
+                    denominator[i]+=p;pv[i]=sycl::bit_cast<uint16_t>(bf16(p)); \
+                } \
+                v4u pa; \
+_Pragma("unroll") \
+                for(int j=0;j<4;++j) { \
+                    const int t0=2*(lane&7); \
+                    const uint16_t a0=sycl::select_from_group(sg,pv[2*j],t0),a1=sycl::select_from_group(sg,pv[2*j+1],t0); \
+                    const uint16_t b0=sycl::select_from_group(sg,pv[2*j],t0+1),b1=sycl::select_from_group(sg,pv[2*j+1],t0+1); \
+                    pa[j]=lane<8?uint32_t(a0)|(uint32_t(b0)<<16):uint32_t(a1)|(uint32_t(b1)<<16); \
+                } \
+_Pragma("unroll") \
+                for(int n=0;n<8;++n) { \
+                    v8u v; \
+                    if((FULL)||token+16<=end)v=load_v_tile(vb+int64_t(token)*256+dh*128,n*16); \
+                    else { \
+_Pragma("unroll") \
+                        for(int e=0;e<8;++e) { \
+                            const uint16_t a=token+2*e<end?sycl::bit_cast<uint16_t>(vb[int64_t(token+2*e)*256+dh*128+n*16+lane]):0; \
+                            const uint16_t b=token+2*e+1<end?sycl::bit_cast<uint16_t>(vb[int64_t(token+2*e+1)*256+dh*128+n*16+lane]):0; \
+                            v[e]=uint32_t(a)|(uint32_t(b)<<16); \
+                        } \
+                    } \
+                    dpas16<bf16>(O[n],pa,v); \
+                } \
+            } \
+        } while(0)
+        // A complete64-token step never executes generic tail loads. Keep the
+        // source macro shape: generic pointers to captured matrix arrays inhibit
+        // IGC lowering/scheduling. Only the final partial step uses masked loads.
+        int tb=beg;
+        for(;tb+64<=end;tb+=64) { CORE_MONO_STEP(4,true); }
+        // Source NT1 tail: avoid executing masked NT4 over32/16 remaining tokens.
+        for(;tb<end;tb+=16) { CORE_MONO_STEP(1,false); }
+#undef CORE_MONO_STEP
+        v8f totals;
+#pragma unroll
+        for(int i=0;i<8;++i)totals[i]=sycl::reduce_over_group(sg,denominator[i],sycl::plus<float>());
+        const int64_t unit=int64_t(kh)*chunks+c;
+#pragma unroll
+        for(int n=0;n<8;++n) {
+            jm::joint_matrix<sycl::sub_group,float,jm::use::accumulator,8,16> out;
+            jm::joint_matrix_fill(sg,out,0.f);auto w=sycl::ext::oneapi::detail::get_wi_data(sg,out);
+#pragma unroll
+            for(int i=0;i<8;++i)w[i]=O[n][i];
+            jm::joint_matrix_store(sg,out,gp(part+(unit*NMT*8+mt*8)*256+dh*128+n*16),256,jm::layout::row_major);
+        }
+        // Each D-half has its own metadata. The selected merge must not
+        // depend on the other half's producers finishing at the same time.
+        if(NMT==1||dh==0) {
+            const int64_t plane=int64_t(NMT==1?dh:0)*HK*chunks*NMT*8*2;
+#pragma unroll
+            for(int i=0;i<8;++i)if(lane==i){ml[plane+(unit*NMT*8+mt*8+i)*2]=maximum[i];ml[plane+(unit*NMT*8+mt*8+i)*2+1]=totals[i];}
+        }
+    }
+}
+} // namespace ad
+
+// Local publication/parallel chunk weights follow the vLLM mono merge design;
+// keep Comfy FP32 partials, fixed-order sum and arbitrary tree masks.
+inline void merge_barrier(sycl::group<1> g) {
+#if defined(__SYCL_DEVICE_ONLY__)
+    __spirv_ControlBarrier(__spv::Scope::Workgroup,__spv::Scope::Workgroup,
+        __spv::MemorySemanticsMask::AcquireRelease|__spv::MemorySemanticsMask::WorkgroupMemory);
+#else
+    sycl::group_barrier(g);
+#endif
+}
+template<int NMT>
+inline void merge(sycl::nd_item<1>& it,const bf16* Qp,const bf16* XK,const bf16* XV,const int* masks,
+                  const int* lens,int H,int HK,int R,int cap,int chunks,const float* part,const float* ml,bf16* dest,int64_t vrow_stride,float* shared) {
+    // The tree is at most8 rows. One SG owns128 output dimensions and computes
+    // the small256D tree score locally, removing the serial WG barrier per row.
+    // Prefix max/weights/denominator are shared with register shuffles, as in
+    // the source mono design; retain FP32 partials and the same arbitrary mask.
+    const int sgidx=it.get_local_id(0)/16,lane=it.get_local_id(0)%16,wg=it.get_group(0),nw=it.get_group_range(0),groups=H/HK;
+    auto sg=it.get_sub_group();
+    const int L=sycl::min(cap,sycl::max(0,lens[0]));int per,active;ad::chunking(L,chunks,per,active);
+    for(int job=wg*(CWG/16)+sgidx;job<H*R*2;job+=nw*(CWG/16)) {
+        const int dh=job%2,s=job/2%R,h=job/(2*R),kh=h/groups,r=(h%groups)*R+s;const int64_t base=int64_t(kh)*chunks;
+        float M=-INFINITY;
+        for(int c=lane;c<active;c+=16)M=sycl::fmax(M,ml[((base+c)*NMT*8+r)*2]);
+        M=sycl::reduce_over_group(sg,M,sycl::maximum<float>());
+        const float w0=lane<active?sycl::native::exp2(ml[((base+lane)*NMT*8+r)*2]-M):0.f;
+        const float w1=lane+16<active?sycl::native::exp2(ml[((base+lane+16)*NMT*8+r)*2]-M):0.f;
+        const float w2=lane+32<active?sycl::native::exp2(ml[((base+lane+32)*NMT*8+r)*2]-M):0.f;
+        float sum=0.f;
+        if(lane<active)sum=ml[((base+lane)*NMT*8+r)*2+1]*w0;
+        if(lane+16<active)sum+=ml[((base+lane+16)*NMT*8+r)*2+1]*w1;
+        if(lane+32<active)sum+=ml[((base+lane+32)*NMT*8+r)*2+1]*w2;
+        sum=sycl::reduce_over_group(sg,sum,sycl::plus<float>());
+        ad::v8f acc=ad::v8f(0.f);
+        for(int cb=0;cb<active;cb+=16) {
+            const float own=cb==0?w0:(cb==16?w1:w2);
+#pragma unroll 4
+            for(int j=0;j<16;++j)if(cb+j<active) {
+                const float w=sycl::select_from_group(sg,own,j);const int64_t start=((base+cb+j)*NMT*8+r)*256+dh*128+lane;
+#pragma unroll
+                for(int d=0;d<8;++d)acc[d]+=part[start+d*16]*w;
+            }
+        }
+        float query[16];
+#pragma unroll
+        for(int d=0;d<16;++d)query[d]=float(Qp[(int64_t(kh)*NMT*8+r)*256+lane+d*16]);
+        for(int tr=0;tr<R;++tr)if(masks&&((masks[s]>>tr)&1)) {
+            float dot=0.f;
+#pragma unroll
+            for(int d=0;d<16;++d)dot+=query[d]*float(XK[(int64_t(kh)*R+tr)*256+lane+d*16]);
+            const float score=sycl::reduce_over_group(sg,dot,sycl::plus<float>())*(0.0625f*0x1.715476p0f);
+            const float M2=sycl::fmax(M,score),fp=M==-INFINITY?0.f:sycl::native::exp2(M-M2),ft=sycl::native::exp2(score-M2);
+#pragma unroll
+            for(int d=0;d<8;++d)acc[d]=acc[d]*fp+ft*float(XV[int64_t(tr)*vrow_stride+kh*256+dh*128+lane+d*16]);
+            sum=sum*fp+ft;M=M2;
+        }
+#pragma unroll
+        for(int d=0;d<8;++d)dest[(int64_t(s)*H+h)*256+dh*128+lane+d*16]=bf16(sum>0.f?acc[d]/sum:0.f);
+    }
+}
+template<int NMT>
+inline void merge_selected(sycl::nd_item<1>& it,const bf16* Qp,const bf16* XK,const bf16* XV,const int* masks,
+                  const int* lens,int H,int HK,int R,int cap,int chunks,const float* part,const float* ml,bf16* dest,int64_t vrow_stride,float* shared) {
+    // The tree is at most8 rows. One SG owns128 output dimensions and computes
+    // the small256D tree score locally, removing the serial WG barrier per row.
+    // Prefix max/weights/denominator are shared with register shuffles, as in
+    // the source mono design; retain FP32 partials and the same arbitrary mask.
+    const int sgidx=it.get_local_id(0)/16,lane=it.get_local_id(0)%16,wg=it.get_group(0),nw=it.get_group_range(0),groups=H/HK;
+    auto sg=it.get_sub_group();
+    const int L=sycl::min(cap,sycl::max(0,lens[0]));int per,active;ad::chunking(L,chunks,per,active);
+    const int dh=wg%2,mt=wg/2%NMT,live_rows=sycl::min(8,groups*R-mt*8);
+    ml+=int64_t(dh)*HK*chunks*NMT*8*2;
+    for(int job=sgidx;job<HK*live_rows;job+=CWG/16) {
+        const int kh=job/live_rows,r=mt*8+job%live_rows,s=r%R,h=kh*groups+r/R;
+        const int64_t base=int64_t(kh)*chunks;
+        float M=-INFINITY;
+        for(int c=lane;c<active;c+=16)M=sycl::fmax(M,ml[((base+c)*NMT*8+r)*2]);
+        M=sycl::reduce_over_group(sg,M,sycl::maximum<float>());
+        const float w0=lane<active?sycl::native::exp2(ml[((base+lane)*NMT*8+r)*2]-M):0.f;
+        const float w1=lane+16<active?sycl::native::exp2(ml[((base+lane+16)*NMT*8+r)*2]-M):0.f;
+        const float w2=lane+32<active?sycl::native::exp2(ml[((base+lane+32)*NMT*8+r)*2]-M):0.f;
+        float sum=0.f;
+        if(lane<active)sum=ml[((base+lane)*NMT*8+r)*2+1]*w0;
+        if(lane+16<active)sum+=ml[((base+lane+16)*NMT*8+r)*2+1]*w1;
+        if(lane+32<active)sum+=ml[((base+lane+32)*NMT*8+r)*2+1]*w2;
+        sum=sycl::reduce_over_group(sg,sum,sycl::plus<float>());
+        ad::v8f acc=ad::v8f(0.f);
+        for(int cb=0;cb<active;cb+=16) {
+            const float own=cb==0?w0:(cb==16?w1:w2);
+#pragma unroll 4
+            for(int j=0;j<16;++j)if(cb+j<active) {
+                const float w=sycl::select_from_group(sg,own,j);const int64_t start=((base+cb+j)*NMT*8+r)*256+dh*128+lane;
+#pragma unroll
+                for(int d=0;d<8;++d)acc[d]+=part[start+d*16]*w;
+            }
+        }
+        float query[16];
+#pragma unroll
+        for(int d=0;d<16;++d)query[d]=float(Qp[(int64_t(kh)*NMT*8+r)*256+lane+d*16]);
+        for(int tr=0;tr<R;++tr)if(masks&&((masks[s]>>tr)&1)) {
+            float dot=0.f;
+#pragma unroll
+            for(int d=0;d<16;++d)dot+=query[d]*float(XK[(int64_t(kh)*R+tr)*256+lane+d*16]);
+            const float score=sycl::reduce_over_group(sg,dot,sycl::plus<float>())*(0.0625f*0x1.715476p0f);
+            const float M2=sycl::fmax(M,score),fp=M==-INFINITY?0.f:sycl::native::exp2(M-M2),ft=sycl::native::exp2(score-M2);
+#pragma unroll
+            for(int d=0;d<8;++d)acc[d]=acc[d]*fp+ft*float(XV[int64_t(tr)*vrow_stride+kh*256+dh*128+lane+d*16]);
+            sum=sum*fp+ft;M=M2;
+        }
+#pragma unroll
+        for(int d=0;d<8;++d)dest[(int64_t(s)*H+h)*256+dh*128+lane+d*16]=bf16(sum>0.f?acc[d]/sum:0.f);
+    }
+}
+template<int NMT> class AttentionMonoCore;
+} // namespace
+std::shared_ptr<AttentionMonoWorkspace> attention_mono_workspace(
+    torch::Tensor rawq,torch::Tensor rawk,torch::Tensor key) {
+    TORCH_CHECK(rawq.is_xpu()&&rawq.scalar_type()==at::kBFloat16&&rawq.dim()==4&&rawq.size(0)==1&&rawq.size(3)==256,
+                "Q: XPU BF16 [1,S,Hq,256]");
+    TORCH_CHECK(rawk.device()==rawq.device()&&rawk.scalar_type()==at::kBFloat16&&rawk.dim()==4&&rawk.size(0)==1&&rawk.size(3)==256&&rawk.size(1)==rawq.size(1),
+                "K: BF16 [1,S,Hk,256] on the Q device");
+    const int R=rawq.size(1),Hq=rawq.size(2),HK=rawk.size(2);
+    TORCH_CHECK(R>=1&&R<=8&&Hq>0&&HK>0&&Hq%HK==0,"1..8 rows and GQA heads");
+    TORCH_CHECK(key.device()==rawq.device()&&key.scalar_type()==at::kBFloat16&&key.dim()==4&&key.size(0)==1&&key.size(1)==HK&&key.size(2)>=R&&key.size(3)==256&&key.is_contiguous(),
+                "cache: contiguous BF16 [1,Hk,capacity,256] on the Q device");
+    const int cap=key.size(2),nmt=(R*(Hq/HK)+7)/8;
+    TORCH_CHECK(nmt<=4,"at most32 query rows per KV head");
+    auto& queue=c10::xpu::getCurrentXPUStream(rawq.get_device()).queue();
+    const int cores=queue.get_device().get_info<sycl::info::device::max_compute_units>()/8;
+    const int legacy=std::max(1,std::min(48,(cap+255)/256));
+    const int grid=std::min(cores*2,HK*legacy);
+    TORCH_CHECK(grid>0,"a resident attention grid is required");
+    const int chunks=std::max(1,std::min(legacy,grid*(CWG/16)/(HK*nmt*2)));
+    auto w=std::make_shared<AttentionMonoWorkspace>();
+    w->rows=R;w->heads=Hq;w->kv_heads=HK;w->capacity=cap;w->tiles=nmt;w->chunks=chunks;
+    w->groups=std::min(grid,HK*chunks);w->device=rawq.get_device();
+    w->packed_q=torch::empty({HK,nmt,16,16,4},rawq.options().dtype(at::kInt));
+    w->q=torch::empty({HK,nmt*8,256},rawq.options());
+    w->k=torch::empty({1,HK,R,256},rawq.options());
+    w->output=torch::empty({1,R,Hq*256},rawq.options());
+    w->partial=torch::empty({HK,chunks,nmt*8,256},rawq.options().dtype(at::kFloat));
+    w->metadata=torch::empty({nmt==1?2:1,HK,chunks,nmt*8,2},rawq.options().dtype(at::kFloat));
+    w->counter=torch::zeros({2+2*nmt},rawq.options().dtype(at::kInt));
+    return w;
+}
+
+template<int NMT>
+std::vector<torch::Tensor> run_attention_mono(torch::Tensor rawq,torch::Tensor rawk,torch::Tensor vn,
+ torch::Tensor weightq,torch::Tensor weightk,torch::Tensor freqs,torch::Tensor key,torch::Tensor value,
+ torch::Tensor position,torch::Tensor seqlen,torch::Tensor mask,double epsq,double epsk,int64_t rd,
+ const std::shared_ptr<AttentionMonoWorkspace>& workspace) {
+    const int R=workspace->rows,Hq=workspace->heads,HK=workspace->kv_heads,cap=workspace->capacity,chunks=workspace->chunks;
+    const uint32_t NW=workspace->groups;
+    auto& queue=c10::xpu::getCurrentXPUStream(rawq.get_device()).queue();
+    const auto& qpacked=workspace->packed_q;const auto& q=workspace->q;const auto& k=workspace->k;
+    const auto& y=workspace->output;const auto& part=workspace->partial;const auto& ml=workspace->metadata;
+    auto* QPA=reinterpret_cast<uint32_t*>(qpacked.data_ptr());
+    auto* cnt=reinterpret_cast<uint32_t*>(workspace->counter.data_ptr());
+    const auto* qp=reinterpret_cast<const bf16*>(rawq.data_ptr());const auto* kp=reinterpret_cast<const bf16*>(rawk.data_ptr());const auto* vp=reinterpret_cast<const bf16*>(vn.data_ptr());
+    const auto* qw=reinterpret_cast<const bf16*>(weightq.data_ptr());const auto* kw=reinterpret_cast<const bf16*>(weightk.data_ptr());
+    const auto* fp=freqs.data_ptr<float>();const auto* pp=position.data_ptr<int64_t>();const auto* lens=seqlen.data_ptr<int>();const int* masks=mask.numel()?mask.data_ptr<int>():nullptr;
+    auto* Qp=reinterpret_cast<bf16*>(q.data_ptr());auto* Kp=reinterpret_cast<bf16*>(k.data_ptr());auto* Kc=reinterpret_cast<bf16*>(key.data_ptr());auto* Vc=reinterpret_cast<bf16*>(value.data_ptr());auto* dest=reinterpret_cast<bf16*>(y.data_ptr());
+    auto* partp=part.data_ptr<float>();auto* mlp=ml.data_ptr<float>();const float eq=float(epsq),ek=float(epsk);
+    const int64_t qs=rawq.stride(1),ks=rawk.stride(1),vs=vn.stride(1);const bool q_torch=!rawq.is_contiguous();const int64_t fs=freqs.stride(0);
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16,1> scratch((CWG/128)*256,cgh);
+        sycl::local_accessor<float,1> sums(18,cgh);
+        sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+        cgh.parallel_for<AttentionMonoCore<NMT>>(sycl::nd_range<1>(NW*CWG,CWG),props,[=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            uint32_t epoch=0;
+            auto* scratchp=scratch.template get_multi_ptr<sycl::access::decorated::no>().get();
+            norms_rope(it,qp,kp,vp,qw,kw,fp,pp,Qp,QPA,Kp,Kc,Vc,R,Hq,HK,NMT*8,cap,rd,eq,ek,qs,ks,vs,q_torch,fs,
+                       sums.template get_multi_ptr<sycl::access::decorated::no>().get(),scratchp);
+            grid_sync(it,cnt,NW,epoch);
+            ad::partial<NMT>(it,QPA,Kc,Vc,lens,HK,cap,chunks,partp,mlp,scratchp);
+            if(NMT==1&&NW%(2*NMT)==0) {
+                // Each WG has one (query tile, D half); the final producer of
+                // that group merges its chunks. Other WGs can return, as in
+                // this project's fast_topk last-producer protocol. All partial
+                // writes are published before the acq_rel arrival counter.
+                sycl::group_barrier(it.get_group());
+                auto* ready=sums.template get_multi_ptr<sycl::access::decorated::no>().get();
+                if(it.get_local_id(0)==0) {
+                    using A=sycl::atomic_ref<uint32_t,sycl::memory_order::acq_rel,sycl::memory_scope::device,sycl::access::address_space::global_space>;
+                    const int g=it.get_group(0)%(2*NMT);
+                    A arrivals(cnt[2+g]);const bool last=arrivals.fetch_add(1u)==NW/(2*NMT)-1;
+                    ready[0]=last?1.f:0.f;
+                    if(last) {
+                        arrivals.store(0u);A done(cnt[1]);
+                        // Every group finishing proves that all WGs left the
+                        // norm barrier. No waiter can observe a reset counter.
+                        if(done.fetch_add(1u)==2*NMT-1) {A(cnt[0]).store(0u);done.store(0u);}
+                    }
+                }
+                // Match fast_topk's global+local publication to every SG,
+                // after the leader acquired all other producers' partials.
+                sycl::group_barrier(it.get_group());
+                if(ready[0]!=0.f)merge_selected<NMT>(it,Qp,Kp,vp,masks,lens,Hq,HK,R,cap,chunks,partp,mlp,dest,vs,reinterpret_cast<float*>(scratchp));
+            } else {
+                grid_sync(it,cnt,NW,epoch);
+                merge<NMT>(it,Qp,Kp,vp,masks,lens,Hq,HK,R,cap,chunks,partp,mlp,dest,vs,reinterpret_cast<float*>(scratchp));
+                finish(it,cnt,NW);
+            }
+        });
+    });
+    return {y,q,k};
+}
+
+std::vector<torch::Tensor> attention_mono(torch::Tensor rawq,torch::Tensor rawk,torch::Tensor vn,
+ torch::Tensor weightq,torch::Tensor weightk,torch::Tensor freqs,torch::Tensor key,torch::Tensor value,
+ torch::Tensor position,torch::Tensor seqlen,torch::Tensor mask,double epsq,double epsk,int64_t rd,
+ const std::shared_ptr<AttentionMonoWorkspace>& workspace) {
+    TORCH_CHECK(workspace,"a generation-owned attention workspace is required");
+    TORCH_CHECK(rawq.is_xpu()&&rawq.get_device()==workspace->device&&rawq.scalar_type()==at::kBFloat16&&rawq.dim()==4&&rawq.size(0)==1&&rawq.size(1)==workspace->rows&&rawq.size(2)==workspace->heads&&rawq.size(3)==256,
+                "Q must match the workspace device and [1,S,Hq,256]");
+    const int R=workspace->rows,HK=workspace->kv_heads;
+    for(const auto& t:{rawk,vn,weightq,weightk,key,value})TORCH_CHECK(t.device()==rawq.device()&&t.scalar_type()==at::kBFloat16,"BF16 operands on the Q device");
+    TORCH_CHECK(rawk.dim()==4&&rawk.size(0)==1&&rawk.size(1)==R&&rawk.size(2)==HK&&rawk.size(3)==256&&vn.sizes()==rawk.sizes(),"K/V match workspace [1,S,Hk,256]");
+    TORCH_CHECK(rawq.stride(3)==1&&rawq.stride(2)==512&&rawk.is_contiguous()&&vn.stride(3)==1&&vn.stride(2)==256,"gated Q/dense K/V heads");
+    TORCH_CHECK(key.sizes()==value.sizes()&&key.dim()==4&&key.size(0)==1&&key.size(1)==HK&&key.size(2)==workspace->capacity&&key.size(3)==256&&key.is_contiguous()&&value.is_contiguous(),"cache matches workspace");
+    TORCH_CHECK(weightq.dim()==1&&weightq.numel()==256&&weightq.is_contiguous()&&weightk.dim()==1&&weightk.numel()==256&&weightk.is_contiguous(),"contiguous BF16 norm weights [256]");
+    TORCH_CHECK(rd>0&&rd<=256&&rd%2==0&&epsq>0&&epsk>0,"positive eps and even rotary dimension <=256");
+    TORCH_CHECK(freqs.device()==rawq.device()&&freqs.scalar_type()==at::kFloat&&freqs.dim()==4&&freqs.size(0)==R&&freqs.size(1)==rd/2&&freqs.size(2)==2&&freqs.size(3)==2&&freqs.stride(1)==4&&freqs.stride(2)==2&&freqs.stride(3)==1,"FP32 frequencies [S,rd/2,2,2] with dense inner dimensions");
+    TORCH_CHECK(position.device()==rawq.device()&&position.scalar_type()==at::kLong&&position.dim()==1&&position.is_contiguous()&&position.numel()>=R,"contiguous INT64 positions [>=S]");
+    TORCH_CHECK(seqlen.device()==rawq.device()&&seqlen.scalar_type()==at::kInt&&seqlen.is_contiguous()&&seqlen.numel()==1,"INT32 prefix length [1]");
+    TORCH_CHECK(mask.device()==rawq.device()&&mask.scalar_type()==at::kInt&&mask.dim()==1&&mask.is_contiguous()&&(mask.numel()==R||(R==1&&mask.numel()==0)),"INT32 tree mask [S], or empty for a single row");
+    switch(workspace->tiles) {
+    case 1:return run_attention_mono<1>(rawq,rawk,vn,weightq,weightk,freqs,key,value,position,seqlen,mask,epsq,epsk,rd,workspace);
+    case 2:return run_attention_mono<2>(rawq,rawk,vn,weightq,weightk,freqs,key,value,position,seqlen,mask,epsq,epsk,rd,workspace);
+    case 3:return run_attention_mono<3>(rawq,rawk,vn,weightq,weightk,freqs,key,value,position,seqlen,mask,epsq,epsk,rd,workspace);
+    default:return run_attention_mono<4>(rawq,rawk,vn,weightq,weightk,freqs,key,value,position,seqlen,mask,epsq,epsk,rd,workspace);
+    }
+}
+} // namespace mono_decode_xpu

@@ -24,6 +24,7 @@ keeping every output bit unchanged.
 | `csrc/mono_mlp.sycl` | `mono_mlp`: one-launch MLP block, used outside the layer path. |
 | `csrc/attn_port.sycl` | `attn_core`: Kitchen `decode_gqa` + combine + `tree_merge` in one launch, for the tree verify rows and the single draft row. |
 | `csrc/attn_dpas.sycl` | `attn_dpas`: decode attention (tree verify rows and the draft row) with DPAS, split by the actual context length, then a merge with the tree rows. Not bit-identical to Kitchen. |
+| `csrc/attn_mono.sycl` | Complete Q/K RMSNorm, BF16 intermediate, RoPE, KV write, DPAS and arbitrary-tree merge in one resident dispatch; uses a generation-owned workspace. |
 | `csrc/rope_kv.sycl` | Q/K RMSNorm, partial split-half RoPE, pass-through lanes and K/V cache write; also the normalization-free RoPE entry. |
 | `csrc/fast_topk.sycl` | Single-row top-k (k ≤ 8) / argmax / both, in torch XPU tie order. |
 | `csrc/w4a8_decode.sycl`, `csrc/act_prep.sycl` | Fused small-M W4A8 linear (SLM codebook, DPAS at M=8) and ConvRot rotate + INT8 quantize. |
@@ -105,8 +106,20 @@ keeping every output bit unchanged.
 
 ### MTP draft
 
+The complete attention core is shared by eligible verify and MTP calls in `_attn_core`.
+It retains the normalizer hook checks, preferred attention selection, component disables and
+first-call comparison with the live normalization/RoPE chain. Its DPAS/native 2D reads and
+NT4/NT1 steps follow the cited vLLM XPU source; FP32 partials and Comfy's tree masks are retained.
+The grid derives its resident task count from the device and actual head/query tiles. At one
+query tile the final producer for each D half performs the merge using independently published
+metadata; wider cases keep the parallel merge. Every counter and intermediate is held by a
+workspace in `tiles.cached`, so graph replays use stable addresses without host epoch updates.
+The workspace is released with that generate's caches after graphs are dropped. Independent
+projection GEMMs retain their existing implementations. Local kernel evidence does not qualify
+the official workflow or establish an end-to-end improvement.
+
 - The draft block holds BF16 weights. Its GEMMs stay on oneDNN and run at about 96% of DRAM bandwidth.
-- Its attention goes through `rope_kv` + `attn_dpas`.
+- Eligible draft attention uses the same complete core; other supported routes retain `rope_kv` + `attn_dpas`.
 - The logits pick uses `fast_pick`: one pass gives the argmax plus a top-8 list, and the
   following `topk(k ≤ 8)` reuses the list.
 - Under DynamicVRAM the head's BF16 linears keep, for the generate, the tensor comfy hands to
