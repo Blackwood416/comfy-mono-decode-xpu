@@ -42,6 +42,13 @@ keeping every output bit unchanged.
   work-groups. Gate/up pairs stay together, and the output stores use the same mapping. Row-major
   streams and uneven partitions retain contiguous ownership; neither layout changes its bytes or
   integer accumulation order within a K chunk.
+- The post block also accepts compact Hadamard coefficients `[2, 16, 16]`. Kitchen's regular
+  `H256 = kron(H4, H4, H4, H4) / 16` contains only a positive and a negative H16 tile. The kernel
+  retains these two B fragments while loading eight A fragments ahead, selecting the sign from
+  the regular H4 digits. It executes the same 16 DPAS accumulations in the same order. The Python
+  layer prepares this representation from its generated H256; pre/GDN keep their full matrix.
+  The original `[256, 256]` post input retains the general matrix route. `layer_post_h16` advertises
+  the new format so Python cannot pass a compact buffer to an older extension.
 
 ### Persistent layer kernels
 

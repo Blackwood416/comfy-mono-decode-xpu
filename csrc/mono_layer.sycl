@@ -68,6 +68,7 @@ inline void finish(sycl::nd_item<1>& it, uint32_t* cnt, uint32_t NW) {
 }
 
 class LayerPreKernel;
+template <bool CompactH>
 class LayerPostKernel;
 }  // namespace
 
@@ -165,6 +166,7 @@ std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, doub
     return outs;
 }
 
+template <bool CompactH>
 torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::Tensor> gate, torch::Tensor sig_lut,
                          torch::Tensor oq, torch::Tensor os, torch::Tensor osc, torch::Tensor ocb,
                          torch::Tensor norm_w, double eps, torch::Tensor hadamard, torch::Tensor silu_lut,
@@ -179,6 +181,15 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     if (gate) TORCH_CHECK(gate->scalar_type() == at::kBFloat16 && gate->is_contiguous() && (gate->numel() == R * 4096 || gate->numel() == R * 8192), "gate bf16");
     const W4 O = w4_of(oq, os, osc, ocb), G = w4_of(gq, gs, gsc, gcb), U = w4_of(uq, us, usc, ucb), D = w4_of(dq, ds, dsc, dcb);
     TORCH_CHECK(O.k == 4096 && O.n == 4096 && G.k == 4096 && U.n == G.n && D.k == G.n && D.n == 4096 && G.n <= MAXK, "shapes");
+    TORCH_CHECK(hadamard.is_xpu() && hadamard.scalar_type() == at::kBFloat16 && hadamard.is_contiguous(),
+                "hadamard must be contiguous BF16 on XPU");
+    if constexpr (CompactH) {
+        TORCH_CHECK(hadamard.dim() == 3 && hadamard.size(0) == 2 && hadamard.size(1) == 16 && hadamard.size(2) == 16,
+                    "layer_post_h16 requires compact Hadamard [2,16,16]");
+    } else {
+        TORCH_CHECK(hadamard.dim() == 2 && hadamard.size(0) == GS && hadamard.size(1) == GS,
+                    "layer_post requires full Hadamard [256,256]");
+    }
     auto& S = scratch(x);
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
     const uint32_t NW = resident_wgs(queue, nwg);
@@ -227,7 +238,7 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
         sycl::local_accessor<float, 1> nred(1056, cgh);
         sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
         sycl::local_accessor<float, 1> cbl(16, cgh);
-        cgh.parallel_for<LayerPostKernel>(
+        cgh.parallel_for<LayerPostKernel<CompactH>>(
             sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int t = it.get_local_id(0);
                 const uint32_t wg = it.get_group(0);
@@ -264,7 +275,7 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
                         sycl::group_barrier(it.get_group());
                         src = ybp + r * 4096;
                     }
-                    rot_quant_row(it, src, hp, q1p + r * 4096, sp + r, 4096, xr, red);
+                    rot_quant_row<CompactH>(it, src, hp, q1p + r * 4096, sp + r, 4096, xr, red);
                     tab_ok = false;
                 }
                 grid_sync(it, cnt, NW, epoch);
@@ -285,7 +296,7 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
                 if (ST >= 3)
                     for (int64_t r = wg; r < R; r += NW) {
                         rms_norm_row(it, x1p + r * 4096, wp, xnp + r * 4096, e, lred);
-                        rot_quant_row(it, xnp + r * 4096, hp, q1p + r * 4096, sp + 8 + r, 4096, xr, red);
+                        rot_quant_row<CompactH>(it, xnp + r * 4096, hp, q1p + r * 4096, sp + 8 + r, 4096, xr, red);
                         tab_ok = false;
                     }
                 grid_sync(it, cnt, NW, epoch);
@@ -307,7 +318,7 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
                 // ---- phase 5: q2 = rot_quant(h) ----
                 if (ST >= 5)
                     for (int64_t r = wg; r < R; r += NW) {
-                        rot_quant_row(it, hb + r * N1, hp, q2p + r * N1, sp + 16 + r, N1, xr, red);
+                        rot_quant_row<CompactH>(it, hb + r * N1, hp, q2p + r * N1, sp + 16 + r, N1, xr, red);
                         tab_ok = false;
                     }
                 grid_sync(it, cnt, NW, epoch);
@@ -328,4 +339,17 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     });
     return x;
 }
+
+template torch::Tensor layer_post<false>(torch::Tensor x, torch::Tensor y, std::optional<torch::Tensor> gate, torch::Tensor sig_lut,
+                         torch::Tensor oq, torch::Tensor os, torch::Tensor osc, torch::Tensor ocb,
+                         torch::Tensor norm_w, double eps, torch::Tensor hadamard, torch::Tensor silu_lut,
+                         torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
+                         torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
+                         torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop, bool tiled);
+template torch::Tensor layer_post<true>(torch::Tensor x, torch::Tensor y, std::optional<torch::Tensor> gate, torch::Tensor sig_lut,
+                         torch::Tensor oq, torch::Tensor os, torch::Tensor osc, torch::Tensor ocb,
+                         torch::Tensor norm_w, double eps, torch::Tensor hadamard, torch::Tensor silu_lut,
+                         torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
+                         torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
+                         torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop, bool tiled);
 }  // namespace mono_decode_xpu

@@ -327,12 +327,41 @@ inline int choose_ksplit(int64_t tiles_per_wg, int64_t K) {
 }
 
 // rot_quant of one row (see act_prep.sycl), done by one work-group into q[row], s[row]
-template <typename RED>
+template <bool CompactH = false, typename RED>
 inline void rot_quant_row(sycl::nd_item<1>& it, const bf16* x, const bf16* h, int8_t* q, float* s, int64_t K,
                           LPtrF xr, RED& red) {
     auto sg = it.get_sub_group();
     const int t = it.get_local_id(0), sgi = sg.get_group_id()[0];
     const int64_t tiles = (K / GS / 8) * (GS / 16);
+    if constexpr (CompactH) {
+        // H256 block (kh,ch) equals +/- its low 16x16 tile, selected by the regular H4 Kronecker sign.
+        // Compact storage supplies those exact two BF16 tiles; the original DPAS order is kept.
+        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::row_major> bp, bm;
+        jm::joint_matrix_load(sg, bp, gptr(h), 16);
+        jm::joint_matrix_load(sg, bm, gptr(h + 256), 16);
+        for (int64_t tile = sgi; tile < tiles; tile += MSG) {
+            const int64_t gb = tile / (GS / 16);
+            const int cb = tile % (GS / 16);
+            constexpr int KB = 8;
+            jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a[KB];
+            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> c;
+            jm::joint_matrix_fill(sg, c, 0.f);
+            for (int k0 = 0; k0 < GS; k0 += 16 * KB) {
+#pragma unroll
+                for (int u = 0; u < KB; ++u)
+                    jm::joint_matrix_load(sg, a[u], gptr(x + gb * 8 * GS + k0 + 16 * u), GS);
+#pragma unroll
+                for (int u = 0; u < KB; ++u) {
+                    const uint32_t digit_xor = uint32_t((k0 / 16 + u) ^ cb);
+                    if (sycl::popcount(digit_xor & (digit_xor >> 1) & 0x5u) & 1)
+                        jm::joint_matrix_mad(sg, c, a[u], bm, c);
+                    else
+                        jm::joint_matrix_mad(sg, c, a[u], bp, c);
+                }
+            }
+            jm::joint_matrix_store(sg, c, xr + (gb * 8 * GS + cb * 16), GS, jm::layout::row_major);
+        }
+    } else {
     for (int64_t tile = sgi; tile < tiles; tile += MSG) {
         const int64_t gb = tile / (GS / 16);
         const int cb = tile % (GS / 16);
@@ -353,6 +382,7 @@ inline void rot_quant_row(sycl::nd_item<1>& it, const bf16* x, const bf16* h, in
         jm::joint_matrix_store(
             sg, c,
             xr + (gb * 8 * GS + cb * 16), GS, jm::layout::row_major);
+    }
     }
     sycl::group_barrier(it.get_group());
     float amax = 0.f;

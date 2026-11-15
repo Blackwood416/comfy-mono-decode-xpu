@@ -39,7 +39,7 @@ def test_state_write_is_not_replayed(C, monkeypatch, failure):
     monkeypatch.setattr(layer, "_static_plan", lambda block: True)
     monkeypatch.setattr(layer, "_args", lambda *args:
                         dict(tiled=False, norm_in=(None, 0), norm_post=(None, 0), pre=[], out=[], mlp=[]))
-    monkeypatch.setattr(layer, "_constants", lambda device: (None, None, None))
+    monkeypatch.setattr(layer, "_constants", lambda device: (None, None, None, None))
     monkeypatch.setattr(C, "layer_pre", lambda *args: [x] * 4)
 
     def attend(*args):
@@ -55,7 +55,7 @@ def test_state_write_is_not_replayed(C, monkeypatch, failure):
         raise RuntimeError("after state write")
 
     monkeypatch.setattr(layer, "_attn_core", attend)
-    monkeypatch.setattr(C, "layer_post", post)
+    monkeypatch.setattr(C, "layer_post_h16", post)
     assert layer.install()
     with pytest.raises(RuntimeError, match="after state write"):
         Block().forward(x, past_key_value=kv)

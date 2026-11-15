@@ -47,6 +47,7 @@ std::vector<torch::Tensor> qk_norm_rope_kv(torch::Tensor rawq, torch::Tensor raw
 
 std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, double eps, torch::Tensor hadamard,
                                      std::vector<torch::Tensor> mats, int64_t nwg, bool tiled);
+template <bool CompactH>
 torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::Tensor> gate, torch::Tensor sig_lut,
                          torch::Tensor oq, torch::Tensor os, torch::Tensor osc, torch::Tensor ocb,
                          torch::Tensor norm_w, double eps, torch::Tensor hadamard, torch::Tensor silu_lut,
@@ -95,6 +96,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qk_norm_rope_kv", &mono_decode_xpu::qk_norm_rope_kv);
     m.def("layer_pre", &mono_decode_xpu::layer_pre, py::arg("x"), py::arg("norm_w"), py::arg("eps"), py::arg("hadamard"), py::arg("mats"),
           py::arg("nwg") = 0, py::arg("tiled") = true);
-    m.def("layer_post", &mono_decode_xpu::layer_post);
+    m.def("layer_post", &mono_decode_xpu::layer_post<false>);
+    // A distinct entry advertises compact Hadamard support to the Python caller;
+    // a stale extension must not interpret its 512 elements as a dense H256.
+    m.def("layer_post_h16", &mono_decode_xpu::layer_post<true>);
     m.def("rot_quant", &mono_decode_xpu::rot_quant, py::arg("x"), py::arg("h"), py::arg("order") = 0);
 }

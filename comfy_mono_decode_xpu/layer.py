@@ -75,9 +75,13 @@ def _constants(device):
     if c is None:
         from comfy_kitchen.tensor.int8_utils import _build_hadamard
         h = _build_hadamard(256, device=device, dtype=torch.bfloat16).contiguous()
+        # Kitchen's regular H256 is kron(H4, H4, H4, H4) / 16. Its 16x16
+        # blocks use these exact two coefficient tiles; pre/GDN keep the full H.
+        h16 = h[:16, :16]
+        post_h = torch.stack((h16, -h16)).contiguous()
         allbf = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).to(device)
         # torch's own SiLU / sigmoid for every BF16 input
-        c = _consts[device] = (h, F.silu(allbf).contiguous(), torch.sigmoid(allbf).contiguous())
+        c = _consts[device] = (h, post_h, F.silu(allbf).contiguous(), torch.sigmoid(allbf).contiguous())
     return c
 
 
@@ -546,7 +550,7 @@ def install():
 
     def _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention, past_key_value, state):
         tiled = plan["tiled"]
-        h, silu, sig = _constants(x.device)
+        h, post_h, silu, sig = _constants(x.device)
         x2 = x.view(S, 4096)
         if gdn and _single_gdn:
             # the whole GDN block in one launch
@@ -561,7 +565,7 @@ def install():
             _C.layer_gdn(*args)
             if _gdn_split:  # GDN core in one launch, the post block (out proj .. MLP) in layer_post
                 y = _C.layer_gdn_core(x2, S)
-                _C.layer_post(x2, y, None, sig, *plan["out"], npo, epo, h, silu, *plan["mlp"], 0, 6, tiled)
+                _C.layer_post_h16(x2, y, None, sig, *plan["out"], npo, epo, post_h, silu, *plan["mlp"], 0, 6, tiled)
             with _lock:
                 _stats["layer"] += 1
                 _stats["gdn1"] = _stats.get("gdn1", 0) + 1
@@ -583,7 +587,7 @@ def install():
             gate = outs[1]
         nw, eps = plan["norm_post"]
         state["mutated"] = True  # layer_post updates x in place
-        _C.layer_post(x2, y.contiguous(), gate, sig, *plan["out"], nw, eps, h, silu, *plan["mlp"], 0, 6, tiled)
+        _C.layer_post_h16(x2, y.contiguous(), gate, sig, *plan["out"], nw, eps, post_h, silu, *plan["mlp"], 0, 6, tiled)
         with _lock:
             _stats["layer"] += 1
         return x, past_key_value
