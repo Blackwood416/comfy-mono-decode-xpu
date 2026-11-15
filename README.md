@@ -28,11 +28,11 @@ Validated on Arc Pro B70:
 | official template | ComfyUI | validation |
 |---|---|---|
 | MOSS Image (`image_moss_image_t2i`) | v0.45 (and v0.43) | performance and output, see Results |
-| MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | functional: the default workflow completes in DynamicVRAM, prefetch and ordinary-memory modes; prompt-enhance decode about 133–142 tok/s (sampling, auto MTP; `MONO_DECODE_XPU=0`: 24–28 tok/s), see Results |
+| MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | performance and output in DynamicVRAM, see Results (prompt-enhance decode about 140–149 tok/s on every image; `MONO_DECODE_XPU=0`: 24–28 tok/s); the default workflow also completes in prefetch and ordinary-memory modes |
 
 ## Results
 
-All numbers are from one Arc Pro B70. The current results (ComfyUI v0.45, 2026-11-13) use the
+All numbers are from one Arc Pro B70. The current results (ComfyUI v0.45, 2026-11-13 and 2026-11-16) use the
 environment in Requirements with ComfyUI-OmniXPU from intel/llm-scaler main `066f0db`. The Legacy
 results keep their original v0.43 environment (the llm-scaler-omni 0.2.0-b3 ComfyUI image).
 
@@ -59,9 +59,53 @@ measured prompts are the same token sequences as D's (same sha), only faster. C 
 different, equally valid prompts: under `auto` the tree follows each configuration's speed, and the
 decode attention is no longer bit-identical to Kitchen (see the top of this page).
 
+Re-checked with the current source on 2026-11-16 (same procedure, default switches): decode 127.4 tok/s,
+prompt enhance 3.92 s and end to end 23.94 s over the measured runs; every run used the tile-major
+weight copy.
+
 ![MOSS-Image, text seed 1: C / D / D + DRAFT_INT4](docs/demo/moss-045-seed1.jpg)
 
-### MiniMax H3 Image prompt enhance (ComfyUI v0.45, 2026-11-13)
+### MiniMax H3 Image (ComfyUI v0.45, 2026-11-16)
+
+Workflow: the official `image_minimax_h3_image_t2i` default workflow, replayed from the frontend's saved
+Run request: prompt enhance with `thinking` on, sampling on, `auto` MTP, up to 8192 tokens; 2048x2048,
+6 steps, CFG 1, euler/simple, KSampler seed 42; DynamicVRAM. Same procedure as MOSS-Image: a fresh
+server per configuration, the first image (text seed 0), three warmups (101/102/103) and three
+measured runs (text seeds 1/2/3), every run executing prompt enhance, conditioning, sampling and VAE
+again. Prompt-enhance decode:
+
+| tok/s | previous release (`5483586`) | default | + `MONO_DECODE_XPU_DRAFT_INT4=1` |
+|---|---:|---:|---:|
+| first image | 141.0 | 144.5 | 159.4 |
+| later images, measured mean | 119.8 | **146.1** | 161.1 |
+| later images, all six | 115.5-124.9 | 140.1-149.1 | 152.0-163.5 |
+| post-block weights after the first image | checkpoint row-major | tile-major copy | tile-major copy |
+| enhanced prompt tokens (seeds 1/2/3) | 4542 / 3702 / 3733 | 6240 / 6168 / 5106 | 8192 / 5647 / 7581 |
+
+From the second image on, the diffusion model stays resident (about 20 GB of DynamicVRAM pages)
+while the prompt is enhanced again. The previous release sized the per-generate tile-major weight
+copy (3.9 GB) by physically free memory only, found none, and ran the post blocks on the
+checkpoint's row-major weights, about 2 ms slower a step. The current source also counts the resident
+pages of inactive models that the XPU allocator hook can reclaim, so every image gets the copy; the
+diffusion model's pages come back during sampling without a measurable cost. MOSS-Image always had
+room for the copy.
+
+H3 enhanced prompts run to several thousand tokens (thinking), so decode dominates prompt enhance;
+tok/s follows the generated text through the tokens accepted and the drafts run per step. With
+`MONO_DECODE_XPU=0` the same decode runs at 23.7-27.8 tok/s (prompt enhance alone, 2026-11-13).
+All 21 runs completed and saved an image (checked by eye). Thinking sometimes fills all 8192
+tokens without writing the caption (here warmup seed 103 with the default switches and measured
+seed 1 with `DRAFT_INT4`); the image is then generated from an empty prompt. That is an open issue
+of prompt enhance's thinking length, not a decode error.
+
+### Legacy
+
+<details><summary>H3 prompt enhance alone (ComfyUI v0.45, 2026-11-13); ComfyUI v0.43 results (2026-11-11 / 2026-11-12): MOSS-Image C/D comparison, official showcase with images, upstream reference groups, TextGenerate decode alone</summary>
+
+### MiniMax H3 Image prompt enhance alone (ComfyUI v0.45, 2026-11-13)
+
+Prompt enhance ran on a server without the diffusion model loaded, as for the first image of the
+workflow; the current results above measure the whole workflow.
 
 The official H3 Image default workflow (`thinking` on, sampling on, `auto` MTP, up to 8192 tokens),
 prompt enhance alone, decode tok/s over text seeds 0-3 (0-1 for `MONO_DECODE_XPU=0`); the default and
@@ -75,10 +119,6 @@ H3 enhanced prompts run to several thousand tokens (thinking), so decode dominat
 Between runs the per-step device time stays the same (verify about 11.6 ms, tail 2.2 ms, a draft
 about 2.8 ms, or 2.1 ms with `DRAFT_INT4`); tok/s follows the generated text through the tokens
 accepted and the drafts run per step.
-
-### Legacy
-
-<details><summary>ComfyUI v0.43 results (2026-11-11 / 2026-11-12): MOSS-Image C/D comparison, official showcase with images, upstream reference groups, TextGenerate decode alone</summary>
 
 ### MOSS-Image C/D comparison (ComfyUI v0.43, 2026-11-12)
 
@@ -373,8 +413,9 @@ tests/                   no-model pytest unit tests; UI model-validation instruc
 - Packed W4A8 G16 with FP8 group scales, ConvRot 256 and one shared codebook. Anything else falls back.
 - Both resident and DynamicVRAM modes own tile copies for one generate call. After prefill, the
   decision uses the actual packed storage size, allocator pool, inference reserve and free-memory
-  margin. VBAR model residency is budgeted outside Torch's pool. If copies do not fit, the kernels
-  read the original row-major weights. Copies, graph references and component weight caches are
+  margin. VBAR model residency is budgeted outside Torch's pool; with the XPU allocator hook active,
+  resident pages of inactive models (e.g. the diffusion model after the first image) count as
+  reclaimable. If copies do not fit, the kernels read the original row-major weights. Copies, graph references and component weight caches are
   released on return or error without flushing Torch's global cache.
 - Single XPU device per process.
 - Validated on Arc Pro B70 only. The default `bmg` build also runs on other BMG cards (e.g. Arc B580),

@@ -18,6 +18,9 @@ small XPU tensors with controlled failures; they do not load a model.
 Coverage includes the existing numerical comparisons for top-k, RoPE/KV, ConvRot,
 W4A8 linear and both MLP layouts; eligibility checks; and three focused runtime
 regressions (no replay after KV/x writes, and inference-compatible cache lifetime).
+The compact post Hadamard case compares with the full-matrix route on the same
+operands for 1/3/8 rows, including the wider intermediate projection; another case
+checks that only Kitchen's regular H256 takes the compact route.
 On ComfyUI v0.45, two additional cases exercise real combined storage and its residency window,
 then compare the MLP, normalization and projections with the actual combined input-act entry for
 1/3/8 rows. They skip on older ComfyUI versions without that interface.

@@ -39,7 +39,7 @@ def test_state_write_is_not_replayed(C, monkeypatch, failure):
     monkeypatch.setattr(layer, "_static_plan", lambda block: True)
     monkeypatch.setattr(layer, "_args", lambda *args:
                         dict(tiled=False, norm_in=(None, 0), norm_post=(None, 0), pre=[], out=[], mlp=[]))
-    monkeypatch.setattr(layer, "_constants", lambda device: (None, None, None))
+    monkeypatch.setattr(layer, "_constants", lambda device: (None, None, None, None))
     monkeypatch.setattr(C, "layer_pre", lambda *args: [x] * 4)
 
     def attend(*args):
@@ -55,6 +55,7 @@ def test_state_write_is_not_replayed(C, monkeypatch, failure):
         raise RuntimeError("after state write")
 
     monkeypatch.setattr(layer, "_attn_core", attend)
+    monkeypatch.setattr(C, "layer_post_h16", post)
     monkeypatch.setattr(C, "layer_post", post)
     assert layer.install()
     with pytest.raises(RuntimeError, match="after state write"):
@@ -131,6 +132,59 @@ def test_copy_budget_error_reads_row_major(monkeypatch):
         assert not tiles.tiles_enabled() and tiles.stats()["budget"]["layout"] == "row"
     finally:
         tiles.end()
+
+
+def test_inactive_vbar_budget_preserves_active_owners(monkeypatch):
+    device = torch.device("xpu:0")
+    active, shared = object(), types.SimpleNamespace(loaded_size=lambda: 128)
+    control = types.SimpleNamespace(get_xpu_allocator_mode=lambda: "native_hook",
+                                    get_xpu_ur_hook_stats=lambda: {"tracked_alloc_calls": 1})
+    monkeypatch.setitem(sys.modules, "comfy_aimdo", types.SimpleNamespace(control=control))
+    mm = types.ModuleType("comfy.model_management")
+    monkeypatch.setitem(sys.modules, "comfy", types.SimpleNamespace(model_management=mm))
+    monkeypatch.setitem(sys.modules, "comfy.model_management", mm)
+    monkeypatch.setitem(tiles._session, "model", active)
+
+    def loaded(used=False, owner=None, dev=device, dynamic=True, bar=shared):
+        model = types.SimpleNamespace(modules=lambda: iter([owner]), dynamic_vbars={dev: bar})
+        return types.SimpleNamespace(device=dev, currently_used=used,
+                                     model=types.SimpleNamespace(model=model, is_dynamic=lambda: dynamic))
+
+    # Current owner, in-use model, other device and non-dynamic storage cannot contribute.
+    # Shared inactive VBARs contribute their physical backing once.
+    protected = types.SimpleNamespace(loaded_size=lambda: 512)
+    mm.current_loaded_models = [loaded(owner=active, bar=protected), loaded(bar=protected),
+                                loaded(used=True, bar=object()), loaded(dev=torch.device("xpu:1")),
+                                loaded(dynamic=False), loaded(), loaded()]
+    assert tiles._inactive_vram_budget(device) == 128
+    control.get_xpu_allocator_mode = lambda: "global"
+    assert tiles._inactive_vram_budget(device) == 0
+    control.get_xpu_allocator_mode = lambda: "native_hook"
+    control.get_xpu_ur_hook_stats = lambda: {}
+    assert tiles._inactive_vram_budget(device) == 0
+
+
+def test_reclaimable_pages_do_not_override_model_capacity(monkeypatch):
+    device = torch.device("xpu:0")
+    owner = torch.nn.Linear(16, 16, bias=False)
+    owner._v = object()
+    owner.weight._qdata = torch.zeros(16, 16, dtype=torch.int8)
+    owner.weight._params = types.SimpleNamespace(group_size=16, convrot_groupsize=256,
+        scale=torch.ones(32, dtype=torch.uint8), s_channel=torch.ones(16), codebook=torch.ones(16))
+    mm = types.ModuleType("comfy.model_management")
+    mm.minimum_inference_memory = lambda: 100
+    monkeypatch.setitem(sys.modules, "comfy", types.SimpleNamespace(model_management=mm))
+    monkeypatch.setitem(sys.modules, "comfy.model_management", mm)
+    monkeypatch.setitem(tiles._session, "model", owner)
+    monkeypatch.setattr(tiles, "_inactive_vram_budget", lambda device: 10000)
+    monkeypatch.setattr(tiles, "_margin", 64)
+    monkeypatch.setattr(torch.xpu, "memory_reserved", lambda device: 100)
+    monkeypatch.setattr(torch.xpu, "mem_get_info", lambda device: (0, 1024))
+    props = types.SimpleNamespace(total_memory=1024)
+    monkeypatch.setattr(torch.xpu, "get_device_properties", lambda device: props)
+    assert tiles._copy_budget(device)["layout"] == "tile"
+    props.total_memory = 800
+    assert tiles._copy_budget(device)["layout"] == "row"
 
 
 def test_inference_norm_cache_has_generation_lifetime(monkeypatch):

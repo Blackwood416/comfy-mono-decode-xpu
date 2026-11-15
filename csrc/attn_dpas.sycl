@@ -102,6 +102,81 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                 for (int n = 0; n < NT; ++n) jm::joint_matrix_fill(sg, o[n], 0.f);
                 const bf16* kbase = Kc + int64_t(kh) * cap * HD;
                 const bf16* vbase = Vc + int64_t(kh) * cap * HD;
+                // A uniform pre-loop decision keeps the staged capacity-tail path
+                // out of every normal prefix tile, without passing matrix arrays through a lambda.
+                if (L <= (cap / TT) * TT) {
+                for (int tb = beg; tb < end; tb += TT) {
+                    const int tok = tb + lane;
+                    const bool live = tok < end;
+                    constexpr bool full = true; // L is below the aligned cache boundary
+                    // S = Q K^T over the head dim
+                    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> s;
+                    jm::joint_matrix_fill(sg, s, 0.f);
+#pragma unroll 2
+                    for (int dc = 0; dc < HD / 16; ++dc) {
+                        jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a;
+                        jm::joint_matrix_load(sg, a, lp(&qs[(mt * 8) * HD + dc * 16]), HD);
+                        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::col_major> b;
+                        if (full) {
+                            jm::joint_matrix_load(sg, b, gp(kbase + int64_t(tb) * HD + dc * 16), HD);
+                        } else {  // B[k][n] = K[tb + n][dc*16 + k]: stage the 16 rows with zeros past the cache
+                            for (int e = 0; e < 16; ++e)
+                                stage[lane * 16 + e] = tb + lane < cap ? kbase[int64_t(tb + lane) * HD + dc * 16 + e] : bf16(0.f);
+                            sycl::group_barrier(sg);
+                            jm::joint_matrix_load(sg, b, lp(stage), 16);
+                            sycl::group_barrier(sg);
+                        }
+                        jm::joint_matrix_mad(sg, s, a, b, s);
+                    }
+                    // online softmax per row (element i = row i, lane = token)
+                    float sv[8];
+                    {
+                        auto w = sycl::ext::oneapi::detail::get_wi_data(sg, s);  // 8 elements: rows 0-7
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) sv[i] = w[i];
+                    }
+                    float alpha[8];
+                    float* p = sv;  // scores become probabilities in place
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const float v = live ? sv[i] * SCALE : -INFINITY;
+                        const float mx = sycl::reduce_over_group(sg, v, sycl::maximum<float>());
+                        const float mi = sycl::group_broadcast(sg, ml_m, i), li = sycl::group_broadcast(sg, ml_l, i);
+                        const float mn = sycl::fmax(mi, mx);
+                        alpha[i] = mi == -INFINITY ? 0.f : sycl::exp(mi - mn);
+                        p[i] = v == -INFINITY ? 0.f : sycl::exp(v - mn);
+                        const float rs = sycl::reduce_over_group(sg, p[i], sycl::plus<float>());
+                        if (lane == i) { ml_m = mn; ml_l = li * alpha[i] + rs; }
+                    }
+                    // P (lane = token, element i = row i) -> SLM [8][16] -> A fragment
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) pslm[i * 16 + lane] = bf16(p[i]);
+                    sycl::group_barrier(sg);
+                    jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> pa;
+                    jm::joint_matrix_load(sg, pa, lp(pslm), 16);
+#pragma unroll
+                    for (int n = 0; n < NT; ++n) {
+                        {
+                            auto w = sycl::ext::oneapi::detail::get_wi_data(sg, o[n]);
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) w[i] = float(w[i]) * alpha[i];
+                        }
+                        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::row_major> vb;
+                        const bf16* vp = vbase + int64_t(tb) * HD + dh * HALF + n * 16;
+                        if (full) {
+                            jm::joint_matrix_load(sg, vb, gp(vp), HD);
+                        } else {  // cache tail: 16 token rows x 16 dims, zero rows past the cache
+                            for (int e = 0; e < 16; ++e)
+                                stage[e * 16 + lane] = tb + e < cap ? vp[int64_t(e) * HD + lane] : bf16(0.f);
+                            sycl::group_barrier(sg);
+                            jm::joint_matrix_load(sg, vb, lp(stage), 16);
+                            sycl::group_barrier(sg);
+                        }
+                        jm::joint_matrix_mad(sg, o[n], pa, vb, o[n]);
+                    }
+                    sycl::group_barrier(sg);  // pslm / stage are rewritten by the next tile
+                }
+                } else {
                 for (int tb = beg; tb < end; tb += TT) {
                     const int tok = tb + lane;
                     const bool live = tok < end;
@@ -172,6 +247,7 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                         jm::joint_matrix_mad(sg, o[n], pa, vb, o[n]);
                     }
                     sycl::group_barrier(sg);  // pslm / stage are rewritten by the next tile
+                }
                 }
                 // partials: part [HK][chunks][NMT * 8][HD], ml [HK][chunks][NMT * 8][2]
                 const int64_t unit = int64_t(kh) * chunks + c;

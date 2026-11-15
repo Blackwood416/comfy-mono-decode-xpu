@@ -38,6 +38,19 @@ keeping every output bit unchanged.
   reference kernel's.
 - Tile-major layout `[N/16][K/block][16][block]` gives each lane wide, coalesced loads. Row-major
   weights, as DynamicVRAM hands them over, use the same engine with 4× wider per-lane loads.
+- In `layer_post`, evenly divisible tile-major streams distribute consecutive output tiles across
+  work-groups. Gate/up pairs stay together, and the output stores use the same mapping. Row-major
+  streams and uneven partitions retain contiguous ownership; neither layout changes its bytes or
+  integer accumulation order within a K chunk.
+- The post block also accepts compact Hadamard coefficients `[2, 16, 16]`. Kitchen's regular
+  `H256 = kron(H4, H4, H4, H4) / 16` contains only a positive and a negative H16 tile. The kernel
+  retains these two B fragments while loading eight A fragments ahead, selecting the sign from
+  the regular H4 digits. It executes the same 16 DPAS accumulations in the same order. The Python
+  layer takes the two tiles from Kitchen's generated H256 once, rebuilds the full matrix from them
+  with the kernel's sign rule and compares it bit for bit; on any difference (another Hadamard
+  construction) the post block keeps the full-matrix route. Pre/GDN keep their full matrix.
+  The original `[256, 256]` post input retains the general matrix route. `layer_post_h16` advertises
+  the new format so Python cannot pass a compact buffer to an older extension.
 
 ### Persistent layer kernels
 
@@ -84,6 +97,11 @@ keeping every output bit unchanged.
     27 / 50 / 90 us (`attn_core` verify 91 / 230 / 448 us, draft 35 / 59 / 113 us; Kitchen verify
     273 / 484 / 843 us). Not helpful: cooperative K / V staging in SLM per tile (the staging stores
     cost more than the shared loads saved), S^T = K Q^T with Q^T from SLM.
+  - A uniform check before the context loop selects full cache loads when the prefix fits below
+    the capacity's aligned boundary. Prefix masking still handles a partial last prefix tile. A
+    separate general loop retains zero staging for an actual partial capacity tile. The explicit
+    loops avoid putting matrix accumulators through a shared tile-step lambda, which was slower
+    in the development comparison.
 - `attn_core` (with `MONO_DECODE_XPU_ATTN_DPAS=0`) keeps Kitchen's split-K structure (up to 32 splits of the cache capacity, 64-key
   tiles, per-split online softmax, then combine and tree merge), which fixes every row's rounding.
   Two scheduling choices change only which work-group runs what:
@@ -137,6 +155,58 @@ draft hiddens the exact top-7 with ties always lay within the int4 top-32 (group
 `check` mode found 0 mismatches over 8432 drafts. A first version gave each thread 8 consecutive rows
 and missed 6% of drafts, because the top-7 often holds adjacent token ids.
 
+#### Fused draft head (`MONO_DECODE_XPU_DRAFT_FUSED`, default on)
+
+Inside the device loop `draft_head.py` replaces the eager draft (embedding lookup, `MTPHead.forward`,
+lm_head, top-k and the copies after it: 45 launches, about 35 of them small). It keeps upstream's
+structure and the oneDNN GEMMs on BF16 weights owned for the generate (q|k|v and gate|up concatenated,
+about 0.47 GB, instead of draft.py's copies) and fuses the rest (`csrc/draft_fused.sycl`): the int8
+ConvRot embedding row (gather, scale, un-rotate) with both pre-fc RMSNorms and the cat; the input
+norm; `attn * sigmoid(gate)`; `x += o` with the post-attention norm; `silu(gate) * up`; `x += down`
+with the final norm, the lm_head's ConvRot rotation and rowwise INT8 quantization. The lm_head runs
+as the prequantized INT8 GEMM and `draft_pick` (exact mode: the logits as they are) writes the top-n,
+argmax, rank row and the children's verify tokens. A draft is 17 launches. The ConvRot rotations are
+4-stage 4-point butterflies in local memory (H256 = kron(h4, h4, h4, h4) / 16, symmetric): a dense
+256 x 256 product per output, reading H from global memory, took 95 us per call; the butterflies 9.
+The next draft reads the previous one's pre-norm hidden directly (no copies).
+
+Drafts follow the eager arithmetic in FP32 but not its reduction order (the user allowed the draft
+to be non-bitwise; the verify decides every output token). Measured on B70 (H3 PE): accepted
+tokens per step on the fixed tree4s1m8 with sampling 3.026 against 3.043 eager (4 seeds each, within
+the seed spread); a draft 2.75 -> 2.69 ms by the loop's device events (profiles show 2.80 -> 2.67 ms,
+the profiler widens the eager head's many gaps). Observing wrappers on `mtp.forward` (autotree, dev
+tools) are marked `_mono_observer`; a head that bypasses forward calls their `_mono_on_draft`.
+
+#### Verify sampling top-k (`MONO_DECODE_XPU_SAMPLE_TOPK`, default on)
+
+`processed_probs` starts with `torch.topk(logits.float(), top_k)` over the verify rows (8 x 248320):
+270 us of torch XPU's sbtopk gather plus a segmented sort per step. Inside the device loop's verify
+sampling a `TorchFunctionMode` serves that call with `topk_rows`, which returns the same values and
+indices in torch's order: the radix key (the sign-flipped bits: -0 below +0) descending, ties in
+gather order (iteration i / 32768, then thread (i % 4096) / 4, then load (i % 32768) / 4096, then lane
+i % 4), established on 40 random tie-heavy and +-0 trials and checked bit for bit in the unit tests and
+on 3171 real calls (`check` mode). Rows with NaN are not reproduced: torch's radix key has no NaN case
+(+NaN sorts on top, -NaN at the bottom), yet its gather lets a -NaN join a small top-k at the end.
+
+`topk_rows`: four work-groups per row, each owning a quarter. Each thread reads 16-byte chunks and keeps
+its largest key; a 16-ary search over the top 16 bits of the 1024 maxima gives a threshold with at least
+k elements of the quarter above it; a second pass collects those (usually k plus a few) and ranks them
+by the 64-bit (key, gather) rank (heavy ties at the threshold fall back to an exact 64-bit search). The
+row's last work-group merges the four sorted lists: an entry's rank is its own position plus a binary
+search in each other list. 14 us (from the BF16 logits), 20 us in place. On the way: one work-group per
+row took 48 us; a 64-bit search in each of 16 work-groups per row 603 us (48 barriers, 4 waves); a
+merge that compared every entry with all 256 others 14 us of 27 (a sequential local-memory loop).
+
+The sampling is handed the BF16 logits standing for their FP32 copy (`sampling.verify_rows`): topk_rows
+reads them directly, shape queries pass through, the dtype reads FP32, and any other op runs on the
+FP32 copy made then. With temperature 1 and top_k > 0 upstream only takes the shape and the top-k, so
+the 24 us `.float()` copy is gone. top-p then sorts the top-k values: they are sorted already and torch
+XPU's sort is stable (300 of 300 checks, tie-heavy rows included, give the values and an arange), so for
+the values `topk_rows` returned in this mode (a min-p mask only lowers their tail) the sort returns a
+copy and a cached arange instead of a 10 us radix sort. Everything else in the sampling is upstream's;
+the sampled tokens equal upstream's from the same generator in the unit tests (temperature 1 / 0.7 / 0.5,
+top_k 0 / 7 / 20 / 64, top-p, min-p). The tail of a step goes from 2.16 to about 1.85 ms.
+
 ### DynamicVRAM
 
 - Each call takes the linear's GPU weight from `comfy.ops.CastBiasWeightContext`, the same VBAR
@@ -156,6 +226,11 @@ and missed 6% of drafts, because the top-7 often holds adjacent token ids.
   prefill from actual weight storage and the live allocator/inference budget, including VBAR
   residency outside Torch. Component copies and graph/weight caches are dropped on success,
   cancellation or failure; the global allocator pool is kept.
+- With an observed AIMDO native allocation hook, the copy budget may include resident VBAR pages
+  of inactive models on the same device. It excludes the current transformer and in-use models,
+  counts each VBAR once, and retains the full current-model, allocator and inference reserves.
+  Copies use ordinary Torch allocation; the existing hook reclaims pages as needed. Without that
+  capability the budget uses physical free memory. No model is explicitly unloaded for a copy.
 - Stateful dispatch is an error-recovery boundary: once KV, recurrent state or x may have been
   written, the wrapper propagates errors instead of replaying the layer. Only pure operations may
   retry the stock path after disabling their accelerated route.
@@ -255,14 +330,17 @@ inputs (`tests/`). What it took:
 
 ## Not done / ideas
 
-- Draft path after the two-stage lm_head (B70, device loop, per draft): about 30 small ops plus their
-  gaps take about 0.17 ms (the int8 embedding gather chain, two norms and the cat, gate / residual
-  element-wise ops, the lm_head's rotate and quantize); the 8 oneDNN BF16 GEMMs run at about 531 GB/s
-  (0.87 ms; about 0.1 ms above the roof). A fused or persistent draft head could take about 0.5 ms
-  per step.
-- Verify sampling: torch `topk(20)` over 8 x 248k logits (`SbtopkGather`) takes about 250 us of the
-  0.4 ms sampling per step; an exact top-20 in `fast_topk`'s style (values, indices, tie order) would
-  cover most of it.
+- Closed after measuring (2026-11-13):
+  - A BF16 GEMV of our own for the draft head's projections: oneDNN already streams them at 580-597
+    GB/s on cold weights (fc 116 us, q|k|v 143, o 59, gate|up 337, down 173); five tilings of a
+    sub-group-per-rows GEMV were 1-15% slower, also with SwiGLU folded into gate|up. In the head, fc
+    takes 130 us: the ramp after the one-work-group embedding kernel.
+  - A persistent draft kernel: it would need a GEMV at oneDNN's speed; what it could save beyond that is
+    the 12 small launches' gaps (about 40 us per draft) and their one-work-group latency.
+  - The rest of the verify sampling (softmax, cumsum, the top-p masks, multinomial: about 70 us per step
+    with gaps): fusing it while keeping the sampled tokens means reproducing torch XPU's softmax and scan
+    reduction orders and the Philox stream behind multinomial's exponential sampling bit for bit; the
+    gain is about 0.3% of a step.
 
 - Tried without gain (2026-11-12): attention register prefetch of the next tile (exact, 12% slower);
   32-row attention packs (slower at short contexts); skipping `layer_post`'s pair-table rebuilds (no
