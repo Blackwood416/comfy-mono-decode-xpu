@@ -14,8 +14,9 @@ def test_compact_hadamard_post_matches_full(C):
 
     g = torch.Generator(device="cpu").manual_seed(17)
     h = _build_hadamard(256, device="xpu", dtype=torch.bfloat16).contiguous()
-    small = h[:16, :16]
-    compact = torch.stack((small, -small)).contiguous()
+    from comfy_mono_decode_xpu.layer import _compact_post_h
+    compact = _compact_post_h(h)
+    assert compact is not None  # Kitchen's matrix has the regular structure the compact route needs
     bf = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).xpu()
     silu, sig = F.silu(bf).contiguous(), torch.sigmoid(bf).contiguous()
     out = random_w4(4096, 4096, g)
@@ -30,3 +31,23 @@ def test_compact_hadamard_post_matches_full(C):
         C.layer_post(reference, y, None, sig, *out, norm, 1e-6, h, silu, *args, 0, 6, False)
         C.layer_post_h16(actual, y, None, sig, *out, norm, 1e-6, compact, silu, *args, 0, 6, False)
         assert bits_equal(actual, reference), rows
+
+
+def test_compact_hadamard_needs_the_regular_structure(C):
+    pytest.importorskip("comfy_kitchen")
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard
+    from comfy_mono_decode_xpu.layer import _compact_post_h
+
+    h = _build_hadamard(256, device="xpu", dtype=torch.bfloat16).contiguous()
+    compact = _compact_post_h(h)
+    assert compact is not None and compact.shape == (2, 16, 16)
+    assert bits_equal(compact[1], -compact[0])
+    # Sylvester H256 (another valid Hadamard), one flipped sign, a wrong shape: the full-matrix route
+    sylvester = torch.ones(1, 1)
+    for _ in range(8):
+        sylvester = torch.cat((torch.cat((sylvester, sylvester), 1), torch.cat((sylvester, -sylvester), 1)), 0)
+    assert _compact_post_h((sylvester / 16).to(torch.bfloat16).xpu()) is None
+    flipped = h.clone()
+    flipped[37, 200] = -flipped[37, 200]
+    assert _compact_post_h(flipped) is None
+    assert _compact_post_h(h[:128, :128].contiguous()) is None

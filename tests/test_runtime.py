@@ -56,6 +56,7 @@ def test_state_write_is_not_replayed(C, monkeypatch, failure):
 
     monkeypatch.setattr(layer, "_attn_core", attend)
     monkeypatch.setattr(C, "layer_post_h16", post)
+    monkeypatch.setattr(C, "layer_post", post)
     assert layer.install()
     with pytest.raises(RuntimeError, match="after state write"):
         Block().forward(x, past_key_value=kv)

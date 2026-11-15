@@ -46,7 +46,9 @@ keeping every output bit unchanged.
   `H256 = kron(H4, H4, H4, H4) / 16` contains only a positive and a negative H16 tile. The kernel
   retains these two B fragments while loading eight A fragments ahead, selecting the sign from
   the regular H4 digits. It executes the same 16 DPAS accumulations in the same order. The Python
-  layer prepares this representation from its generated H256; pre/GDN keep their full matrix.
+  layer takes the two tiles from Kitchen's generated H256 once, rebuilds the full matrix from them
+  with the kernel's sign rule and compares it bit for bit; on any difference (another Hadamard
+  construction) the post block keeps the full-matrix route. Pre/GDN keep their full matrix.
   The original `[256, 256]` post input retains the general matrix route. `layer_post_h16` advertises
   the new format so Python cannot pass a compact buffer to an older extension.
 

@@ -52,6 +52,7 @@ def stats():
         out = {"layer": _stats["layer"], "gdn1": _stats.get("gdn1", 0), "attn": _stats.get("attn", 0),
                "attn_dpas": _stats.get("attn_dpas", 0),
                "rope": _stats.get("rope", 0), "norm_rope": _stats.get("norm_rope", 0),
+               "post_h16": any(c[1] is not None for c in _consts.values()),
                "fallback": dict(_stats["fallback"])}
     t = tiles.stats()
     out.update(session_tile_bytes=t["tile_bytes"], session_tile_oom=t["tile_oom"],
@@ -70,15 +71,32 @@ class SubpathError(RuntimeError):
     has already been disabled and logged; the layer path stays on, the call is not replayed."""
 
 
+def _compact_post_h(h):
+    """[2, 16, 16] (+H16, -H16) when h is exactly the regular kron(H4, H4, H4, H4) / 16, else None.
+
+    layer_post_h16 takes block (kb, cb) of H256 as -H16 when the base-4 digits of kb ^ cb hold an odd
+    number of 3s (regular H4 is -1 exactly where i ^ j == 3), else +H16. The full matrix is rebuilt here
+    with that rule and compared bit for bit, so any other matrix keeps the full-matrix layer_post."""
+    if h.shape != (256, 256):
+        return None
+    h16 = h[:16, :16]
+    b = torch.arange(16, device=h.device)
+    d = b[:, None] ^ b[None, :]
+    d = d & (d >> 1) & 5  # bit 0: the low digit is 3, bit 2: the high digit is 3
+    neg = ((d & 1) ^ (d >> 2)).bool()
+    full = torch.where(neg[:, None, :, None], -h16[None, :, None, :], h16[None, :, None, :]).reshape(256, 256)
+    if not torch.equal(full.view(torch.int16), h.view(torch.int16)):
+        return None
+    return torch.stack((h16, -h16)).contiguous()
+
+
 def _constants(device):
     c = _consts.get(device)
     if c is None:
         from comfy_kitchen.tensor.int8_utils import _build_hadamard
         h = _build_hadamard(256, device=device, dtype=torch.bfloat16).contiguous()
-        # Kitchen's regular H256 is kron(H4, H4, H4, H4) / 16. Its 16x16
-        # blocks use these exact two coefficient tiles; pre/GDN keep the full H.
-        h16 = h[:16, :16]
-        post_h = torch.stack((h16, -h16)).contiguous()
+        # the post block's two coefficient tiles (None: it keeps the full matrix); pre/GDN keep the full H
+        post_h = _compact_post_h(h)
         allbf = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).to(device)
         # torch's own SiLU / sigmoid for every BF16 input
         c = _consts[device] = (h, post_h, F.silu(allbf).contiguous(), torch.sigmoid(allbf).contiguous())
@@ -551,6 +569,7 @@ def install():
     def _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention, past_key_value, state):
         tiled = plan["tiled"]
         h, post_h, silu, sig = _constants(x.device)
+        post, ph = (_C.layer_post_h16, post_h) if post_h is not None else (_C.layer_post, h)
         x2 = x.view(S, 4096)
         if gdn and _single_gdn:
             # the whole GDN block in one launch
@@ -565,7 +584,7 @@ def install():
             _C.layer_gdn(*args)
             if _gdn_split:  # GDN core in one launch, the post block (out proj .. MLP) in layer_post
                 y = _C.layer_gdn_core(x2, S)
-                _C.layer_post_h16(x2, y, None, sig, *plan["out"], npo, epo, post_h, silu, *plan["mlp"], 0, 6, tiled)
+                post(x2, y, None, sig, *plan["out"], npo, epo, ph, silu, *plan["mlp"], 0, 6, tiled)
             with _lock:
                 _stats["layer"] += 1
                 _stats["gdn1"] = _stats.get("gdn1", 0) + 1
@@ -587,7 +606,7 @@ def install():
             gate = outs[1]
         nw, eps = plan["norm_post"]
         state["mutated"] = True  # layer_post updates x in place
-        _C.layer_post_h16(x2, y.contiguous(), gate, sig, *plan["out"], nw, eps, post_h, silu, *plan["mlp"], 0, 6, tiled)
+        post(x2, y.contiguous(), gate, sig, *plan["out"], nw, eps, ph, silu, *plan["mlp"], 0, 6, tiled)
         with _lock:
             _stats["layer"] += 1
         return x, past_key_value
