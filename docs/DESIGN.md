@@ -63,39 +63,14 @@ keeping every output bit unchanged.
   the device capacity before launch; the common path needs no additional capacity query.
   B580's largest attention pack uses at most one chunk per Xe core; explicit chunk hints, smaller
   packs and other devices keep their existing attention scheduling.
-- `grid_sync` spells out its fences per role: every thread releases its stores to the work-group,
-  thread 0 releases to the device, arrives, polls and acquires once for the work-group (the work-group
-  shares the Xe core's L1; a device-scope acquire is an L1 invalidate). Written as all-thread acq_rel
-  device fences, it compiled to that form or, after unrelated code changes elsewhere in the kernel
-  (IGC fence coalescing), to an L1 invalidate on every sub-group on both sides of every barrier: 6-8 us
-  more per phase of `layer_gdn` in prototypes. The released builds were in the fast form; the explicit
-  form is bit-identical and as fast.
-- The pair table (32768 entries) depends only on the codebook. Each launch of `layer_pre`,
-  `layer_gdn` and `layer_post` fills a global copy at its start, one entry per thread over all
-  work-groups, and every GEMV phase loads it into SLM with 16 B moves from L2 (about 1 us). Building it
-  in every work-group took about 3.5 us of ALU work per GEMV phase, on the critical path of the first
-  GEMV of each launch. Same entries, same lookups.
-- `layer_post` time (32 streamed real layers, R = 8, about 203 us a layer; 215 us in the decode
-  profile): the three GEMV streams run at about 566 GB/s, close to the best read pattern measured on
-  B70 (577 GB/s for 1 KB sub-group interleave). The rest is the three row phases (gate, norm and
-  rot_quant on R work-groups, about 7 us each with their barrier, DRAM idle), barrier waits and the
-  tails of the streams. Tried and not kept (bit-identical, slower):
-  - L2 prefetch of the next GEMV's first steps during a row phase: the prefetch traffic queues the
-    row work-groups' own loads and stores (rot_quant of h took 6.3 -> 14.3 us), more than the stream
-    saves (4 us); idle-work-groups-only or delayed prefetch does not avoid it. The same prefetch saves
-    6-10 us in a microbenchmark whose row work does not touch memory.
-  - Staging the row in SLM for rot_quant (with or without bank padding), 16 A fragments in flight,
-    `noinline` row helpers: the GEMV stream loop itself slows (register allocation is shared by the
-    whole kernel; gate/up 100.5 -> 104.7 us with 16 fragments), and stack calls spill.
+- `grid_sync`: every thread releases its stores to the work-group; thread 0 releases to the device,
+  arrives, polls and acquires once for the work-group, whose threads share the Xe core's L1. The
+  fences are written per role because the compiler's lowering of all-thread device fences depended on
+  unrelated code elsewhere in the kernel.
+- The pair table depends only on the codebook: each launch of `layer_pre`, `layer_gdn` and
+  `layer_post` fills one global copy, and every GEMV phase loads it into SLM.
 - The GDN layer's single fused kernel spilled 1–3 KB per thread at 128 GRF. It is split into a
   core-only kernel (0 spill) plus `layer_post`, which made it faster.
-- Overlapping the serial phases with the next weights (vLLM / SGL-style mono) does not pay at 8 rows
-  (prototype, 2026-11-16): P5 on half the work-groups (two heads each, +3 us) while the other 16 read
-  `layer_post`'s o_proj and the first gate/up steps into L2 with bounded depth. Best GDN layer 314.6 vs
-  313.5 us. Even a perfect warm (a separate kernel reading all of o_proj into L2 just before) saves
-  6.7 of the o_proj phase's 22 us: a GEMV step is about 0.4 us of pair-table decode (SLM gathers) per
-  work-group from L2 against about 1.1 us from DRAM, so a warmed step saves at most ~60% of its DRAM
-  time, and the 16 streaming work-groups moved o_proj's 9.4 MB at about 270 GB/s.
 - `layer_gdn` (the core kernel, P1–P5) keeps every operation of the replaced chain in order; what
   changed is who runs it and when its inputs are requested. Its serial phases are latency-bound:
   - P1: the a / b BF16 linear (64 DPAS units in oneDNN order) runs on idle work-groups as soon as the
