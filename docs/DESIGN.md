@@ -55,6 +55,13 @@ keeping every output bit unchanged.
 ### Persistent layer kernels
 
 - A layer is a sequence of phases separated by device-wide barriers inside one launch.
+- `grid_sync` spells out its fences per role: every thread releases its stores to the work-group,
+  thread 0 releases to the device, arrives, polls and acquires once for the work-group (the work-group
+  shares the Xe core's L1; a device-scope acquire is an L1 invalidate). Written as all-thread acq_rel
+  device fences, it compiled to that form or, after unrelated code changes elsewhere in the kernel
+  (IGC fence coalescing), to an L1 invalidate on every sub-group on both sides of every barrier: 6-8 us
+  more per phase of `layer_gdn` in prototypes. The released builds were in the fast form; the explicit
+  form is bit-identical and as fast.
 - The pair table (32768 entries) depends only on the codebook. Each launch of `layer_pre`,
   `layer_gdn` and `layer_post` fills a global copy at its start, one entry per thread over all
   work-groups, and every GEMV phase loads it into SLM with 16 B moves from L2 (about 1 us). Building it
@@ -74,6 +81,13 @@ keeping every output bit unchanged.
     whole kernel; gate/up 100.5 -> 104.7 us with 16 fragments), and stack calls spill.
 - The GDN layer's single fused kernel spilled 1–3 KB per thread at 128 GRF. It is split into a
   core-only kernel (0 spill) plus `layer_post`, which made it faster.
+- Overlapping the serial phases with the next weights (vLLM / SGL-style mono) does not pay at 8 rows
+  (prototype, 2026-11-16): P5 on half the work-groups (two heads each, +3 us) while the other 16 read
+  `layer_post`'s o_proj and the first gate/up steps into L2 with bounded depth. Best GDN layer 314.6 vs
+  313.5 us. Even a perfect warm (a separate kernel reading all of o_proj into L2 just before) saves
+  6.7 of the o_proj phase's 22 us: a GEMV step is about 0.4 us of pair-table decode (SLM gathers) per
+  work-group from L2 against about 1.1 us from DRAM, so a warmed step saves at most ~60% of its DRAM
+  time, and the 16 streaming work-groups moved o_proj's 9.4 MB at about 270 GB/s.
 - `layer_gdn` (the core kernel, P1–P5) keeps every operation of the replaced chain in order; what
   changed is who runs it and when its inputs are requested. Its serial phases are latency-bound:
   - P1: the a / b BF16 linear (64 DPAS units in oneDNN order) runs on idle work-groups as soon as the
