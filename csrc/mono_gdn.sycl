@@ -219,8 +219,9 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                 if (PF_ON && int(wg) >= R) prefetch_stream(it, SP, wg, NW, PF_P1);
                 for (int r = wg; r < R; r += NW) {
                     rms_norm_row(it, xp + r * 4096, nin, xnp + r * 4096, e_in, lred);
-                    // publish row r of xn to the a / b sub-groups (they run while the rows are rotated)
-                    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+                    // publish row r of xn to the a / b sub-groups (they run while the rows are rotated); a release
+                    // only: an acquire at device scope is an L1 invalidate on every sub-group (see grid_sync)
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
                     sycl::group_barrier(it.get_group());
                     if (t == 0)
                         sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
@@ -244,7 +245,7 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                             }
                         }
                         sycl::group_barrier(sg);
-                        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
                         const int tile = unit / 16, j = unit % 16;
                         const T* w = (tile < 2 ? wap : wbp) + int64_t(tile & 1) * 16 * 4096;
                         // 8 K32 chunks x 2 K16 steps, accumulated in order; the loads of 4 steps are in flight together

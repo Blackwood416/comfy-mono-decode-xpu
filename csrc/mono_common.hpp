@@ -42,24 +42,34 @@ inline auto lptr(T* p) {
     return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
 }
 
+// Device-wide barrier of the resident work-groups, with the fences spelled out per role. Written as
+// all-thread acq_rel device fences, it compiled to one of two forms depending on unrelated code elsewhere
+// in the kernel (IGC fence coalescing): group-scope fences on all threads plus thread 0's device fences
+// (fast), or a device acquire, i.e. an L1 invalidate (fence.ugm.invalidate.gpu), on every sub-group on both
+// sides of every barrier, 6-8 us more per phase. This is the fast form, explicitly: every thread's stores
+// are released to its work-group (they are in the Xe core's L1-to-L2 path ahead of thread 0's device
+// release, the form the persistent kernels have run and been checked bit for bit with); thread 0 arrives,
+// polls and acquires once for the work-group, whose threads share the core's L1 and read other
+// work-groups' data only after the second barrier.
 inline void grid_sync(sycl::nd_item<1>& it, uint32_t* counter, uint32_t nwg, uint32_t& epoch) {
-    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::work_group);
     sycl::group_barrier(it.get_group());
     if (it.get_local_id(0) == 0) {
-        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
                          sycl::access::address_space::global_space>
             a(*counter);
         const uint32_t target = (++epoch) * nwg;
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
         a.fetch_add(1u);
         // poll with an atomic RMW: a plain atomic load can be served stale and never observe
         // the other work-groups' arrivals on Xe2 (measured hang); RMW polling costs ~0.4 us/barrier
         while (a.fetch_add(0u) < target) {
         }
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
     } else {
         ++epoch;
     }
     sycl::group_barrier(it.get_group());
-    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
 }
 
 // the EU math.rsqt (what ESIMD rsqrt lowers to); SPMD sycl::native::rsqrt lowering varies by build
@@ -76,8 +86,10 @@ inline float hw_rsqrt(float x) {
 using LPtrU16 = sycl::multi_ptr<uint16_t, sycl::access::address_space::local_space, sycl::access::decorated::no>;
 using LPtrF = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>;
 constexpr int TAB = 128 * 256;
+// TAB: pair table [fp8 scale byte < 0x80][two packed codes] -> two INT8 values.
+// ACC: minimum SLM split-K accumulators (64 tiles x 128); plan_streams grows them to a launch's share.
 constexpr int ACC = 64 * 128;
-static_assert(MWG == 1024, "pair table build assumes 1024 threads");            // SLM split-K accumulators: up to 64 tiles per work-group           // pair table: [fp8 scale byte < 0x80][two packed codes] -> two INT8 values
+static_assert(MWG == 1024, "pair table build assumes 1024 threads");
 
 // Exact pair table for one codebook: entry (s << 8 | byte) holds the INT8-grid values of the low and
 // high nibble codes of `byte` at FP8 scale byte s, computed with the dec4 formula.
