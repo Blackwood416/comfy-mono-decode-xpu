@@ -11,6 +11,7 @@ from comfy_mono_decode_xpu import guard, layer, mono, tiles
 
 @pytest.mark.parametrize("failure", ["kv", "x", "subpath"])
 def test_state_write_is_not_replayed(C, monkeypatch, failure):
+    pytest.importorskip("comfy.ops")  # the layer path imports ComfyUI's ops (stubbed entry types below)
     x = torch.zeros(1, 1, 4096, dtype=torch.bfloat16, device="xpu")
     kv = torch.zeros(1, device="xpu")
     replay = []
