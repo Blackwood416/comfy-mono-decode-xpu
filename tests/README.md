@@ -18,6 +18,9 @@ small XPU tensors with controlled failures; they do not load a model.
 Coverage includes the existing numerical comparisons for top-k, RoPE/KV, ConvRot,
 W4A8 linear and both MLP layouts; eligibility checks; and three focused runtime
 regressions (no replay after KV/x writes, and inference-compatible cache lifetime).
+The MLP comparison also uses 16 workers in both layouts for 1/3/8 rows to exercise accumulator
+growth on every device. A one-worker request checks that an excessive total SLM footprint fails
+before launch; invalid worker counts still clamp to the resident-core limit.
 The compact post Hadamard case compares with the full-matrix route on the same
 operands for 1/3/8 rows, including the wider intermediate projection; another case
 checks that only Kitchen's regular H256 takes the compact route.

@@ -115,7 +115,7 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
     for (Stream* st : {&SP, &SO, &SG, &SD}) st->tiled = tiled;
     const size_t fixed_slm = STREAM_SLM + NORM_SLM
         + (4 * RG * DH + MISC_SLM) * sizeof(float) + NCTL * sizeof(int);
-    const int64_t accumulator_elements = plan_streams(queue, x, NW, {&SP, &SO, &SG, &SD}, fixed_slm);
+    const int64_t accumulator_elements = plan_streams(queue, NW, {&SP, &SO, &SG, &SD}, fixed_slm);
     auto* xp = reinterpret_cast<T*>(x.data_ptr());
     const auto* nin = reinterpret_cast<const T*>(norm_in.data_ptr());
     const auto* npost = reinterpret_cast<const T*>(norm_post.data_ptr());

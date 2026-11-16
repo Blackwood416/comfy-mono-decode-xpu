@@ -39,10 +39,12 @@ def test_mono_mlp_matches_chain(C):
         assert bits_equal(out, ref), ("row-major", M)
         out_t = C.mono_mlp(xn, H, lut, *[t for w in tiled for t in w], 0, 4, True)
         assert bits_equal(out_t, ref), ("tile-major", M)
+        # 16 workers give the gate/up stream 96 tiles each, beyond the old 8192-element buffer.
+        assert bits_equal(C.mono_mlp(xn, H, lut, *args, 16, 4, False), ref), ("row-major, 16 workers", M)
+        assert bits_equal(C.mono_mlp(xn, H, lut, *[t for w in tiled for t in w], 16, 4, True), ref), ("tile-major, 16 workers", M)
 
     props = torch.xpu.get_device_properties(xn.device)
     for workers in (-1, props.gpu_subslice_count + 1):
         assert bits_equal(C.mono_mlp(xn, H, lut, *args, workers, 4, False), ref)
-    capacity_error = "SLM requirement" if props.device_id == 0xE20B else "tiles per work-group"
-    with pytest.raises(RuntimeError, match=capacity_error):
+    with pytest.raises(RuntimeError, match="persistent SLM requirement"):
         C.mono_mlp(xn, H, lut, *args, 1, 4, False)

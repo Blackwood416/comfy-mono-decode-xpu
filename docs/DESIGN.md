@@ -56,11 +56,13 @@ keeping every output bit unchanged.
 ### Persistent layer kernels
 
 - A layer is a sequence of phases separated by device-wide barriers inside one launch.
-- Launches use at most one work-group per Xe core. On physical B580 (`0xE20B`), fewer cores give
-  each work-group more projection tiles, so accumulator storage grows to the actual stream share.
-  Admission checks the complete fixed and accumulator SLM footprint against the device capacity.
-  Other devices keep the existing accumulator limit and scheduling. B580's largest attention pack
-  uses at most one chunk per Xe core; explicit chunk hints and smaller packs keep their existing routes.
+- Launches use at most one work-group per Xe core: every group must be co-resident for the spinning
+  grid barrier to make progress. Accumulator storage grows to the actual stream share on every
+  device, including when an explicit worker count gives each group more tiles. Growing beyond
+  the original buffer requires checking the complete fixed and accumulator SLM footprint against
+  the device capacity before launch; the common path needs no additional capacity query.
+  B580's largest attention pack uses at most one chunk per Xe core; explicit chunk hints, smaller
+  packs and other devices keep their existing attention scheduling.
 - The GDN layer's single fused kernel spilled 1–3 KB per thread at 128 GRF. It is split into a
   core-only kernel (0 spill) plus `layer_post`, which made it faster.
 - `layer_gdn` (the core kernel, P1–P5) keeps every operation of the replaced chain in order; what
