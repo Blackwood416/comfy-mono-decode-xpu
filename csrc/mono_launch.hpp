@@ -30,7 +30,7 @@ inline int attention_chunks(sycl::queue& queue, const torch::Tensor& like,
     return std::max(1, std::min(limit, (capacity + 255) / 256));
 }
 
-constexpr size_t STREAM_SLM = TAB * sizeof(uint16_t) + MSG * sizeof(float) + 16 * sizeof(float);
+constexpr size_t STREAM_SLM = TAB * sizeof(uint16_t) + MSG * sizeof(float);  // pair table / row region, reduction
 constexpr size_t NORM_SLM = 1056 * sizeof(float);
 
 inline int64_t plan_streams(sycl::queue& queue, uint32_t workers,

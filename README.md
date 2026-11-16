@@ -5,17 +5,21 @@ Decode kernels for ComfyUI prompt enhance (`TextGenerate` / `TextGenerateV2` wit
 
 The hooks sit at the model's decode step, so official workflows and templates speed up without new
 nodes. Numerical checks compare each kernel with the operator chain it replaces, using identical
-inputs, weights, dtype and layout. The one exception is the decode attention (tree-verify rows and the MTP
-draft row), which uses DPAS and a split by the actual context length instead of Kitchen's structure:
-it is checked against an fp64 reference, with Kitchen's own error on the same inputs as the bound
-(`MONO_DECODE_XPU_ATTN_DPAS=0` restores the bit-identical port). The v0.43 fixed-tree results (Results, Legacy) preserved the
-generated token IDs. Workflow qualification checks the generated prompt and final image; it does not require
-whole-generation token identity across different layouts or backend dispatch.
+inputs, weights, dtype and layout. Two parts differ by design:
+- The decode attention (tree-verify rows and the MTP draft row) uses DPAS and a split by the actual
+  context length instead of Kitchen's structure. It is checked against an fp64 reference, with
+  Kitchen's own error on the same inputs as the bound (`MONO_DECODE_XPU_ATTN_DPAS=0` restores the
+  bit-identical port).
+- The fused MTP draft head keeps the eager arithmetic but not its reduction order. Drafts only
+  propose tokens; the verify decides every output token.
+
+The v0.43 fixed-tree results (Results, Legacy) preserved the generated token IDs. Workflow
+qualification checks the generated prompt and final image; it does not require whole-generation token
+identity across different layouts or backend dispatch.
 
 ComfyUI v0.45's `CombinedLinear` is supported: hooks borrow per-projection views of the current
 prefetched weight, and release those views with the forward call. Inactive groups use the ordinary
-cast path. Outputs stay contiguous. The official MiniMax H3 Image default workflow has completed
-with actual layer/GDN/attention/RoPE execution.
+cast path.
 
 ## Supported models and validated workflows
 
@@ -358,7 +362,7 @@ A/B tests. An explicit `1` or `0` on a piece wins over the master switch: for ex
 | variable | when unset | effect |
 |---|---|---|
 | `MONO_DECODE_XPU` | on | Master switch: `0` disables the four pieces below unless a piece is explicitly enabled |
-| `MONO_DECODE_XPU_LAYER` | same as `MONO_DECODE_XPU` | The main speedup. Decode layers run in persistent kernels, with the attention port, fused RoPE + KV write and fast draft top-k/argmax. |
+| `MONO_DECODE_XPU_LAYER` | same as `MONO_DECODE_XPU` | The main speedup. Decode layers run in persistent kernels, with decode attention, fused RoPE + KV write, the device MTP loop and the fused draft head. |
 | `MONO_DECODE_XPU_MONO` | same as `MONO_DECODE_XPU` | Fallback: one-launch MLP block for decode rows that miss the layer path |
 | `MONO_DECODE_XPU_W4` | same as `MONO_DECODE_XPU` | Fallback: fused small-M W4A8 linear for linears outside the layer kernels |
 | `MONO_DECODE_XPU_PREP` | same as `MONO_DECODE_XPU` | Fallback: ConvRot rotate + INT8 quantize in one launch |
@@ -375,29 +379,32 @@ MTP head. Per verify layer:
   the out projection, residual, post norm, MLP and residual.
 - **Full-attention layers (8):** `layer_pre`, then fused Q/K norm + partial RoPE + KV write, then
   `attn_dpas` (DPAS tree attention split along the context, then a merge), then `layer_post`.
-- **MTP draft:** the BF16 draft block's attention uses `rope_kv` and `attn_dpas`. Top-k and
-  argmax over the 248k-vocab logits run in one launch with torch's exact tie order.
 - **MTP loop:** the per-step bookkeeping (accept walk, cache counters, KV slot moves, next token)
   runs on the device and the host reads each step's tokens one step late, so steps follow each other
-  without a host sync. Experimental and off by default: `MONO_DECODE_XPU_DRAFT_INT4=1` scores a draft's
-  vocabulary with an int4 copy of the lm_head and recomputes the best candidates exactly in int8
-  (only drafts change; see [docs/ENV.md](docs/ENV.md)).
+  without a host sync. The verify sampling's top-k over the 248k vocabulary runs as one exact kernel.
+- **MTP draft:** the BF16 draft block keeps its oneDNN GEMMs; the small ops around them are fused,
+  its attention uses `rope_kv` and `attn_dpas`, and one launch picks the draft tokens.
+- **Experimental, off by default:** `MONO_DECODE_XPU_DRAFT_INT4=1` scores a draft's vocabulary with an
+  int4 copy of the lm_head and recomputes the best candidates exactly in int8 (only drafts change;
+  see [docs/ENV.md](docs/ENV.md)).
 
 The persistent kernels stream W4 weights through a GEMV engine with device-wide grid barriers. The
 engine uses an exact FP8 group-scale pair table and int32 split-K, and reproduces the reference
 reduction order. Under DynamicVRAM, each linear's weight comes from comfy's VBAR cast every call. A
 per-generate tile-major copy, made while there is VRAM headroom, keeps the fast layout.
 
-Details, exactness method and measurements: [docs/DESIGN.md](docs/DESIGN.md).
+Design and exactness: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Layout
 
 ```
 __init__.py              ComfyUI entry point (env-gated install, adds no nodes)
-comfy_mono_decode_xpu/   routing: layer.py (layers, attention, RoPE, sessions), logits.py (picks),
-                         mono.py (MLP block), patch.py (W4 linear, rotate+quant), mtp_loop.py (device
-                         MTP loop), draft.py / graph_draft.py (draft head weights, XPU graph),
-                         draft_lmhead.py (experimental two-stage draft lm_head), autotree.py, tiles.py,
+comfy_mono_decode_xpu/   routing: layer.py (layers, attention, RoPE), tiles.py (per-generate weight
+                         copies), guard.py (error recovery), logits.py (picks), mono.py (MLP block),
+                         patch.py (W4 linear, rotate+quant), mtp_loop.py (device MTP loop),
+                         sampling.py (verify-sampling top-k), draft_head.py (fused draft head),
+                         draft.py / graph_draft.py (eager draft head weights, XPU graph),
+                         draft_lmhead.py (experimental two-stage draft lm_head), autotree.py,
                          graph_step.py (experimental)
 csrc/                    SYCL kernels (see docs/DESIGN.md) and bindings
 install.py / install.sh  build the extension in place (ComfyUI-Manager runs install.py)
@@ -418,8 +425,9 @@ tests/                   no-model pytest unit tests; UI model-validation instruc
   reclaimable. If copies do not fit, the kernels read the original row-major weights. Copies, graph references and component weight caches are
   released on return or error without flushing Torch's global cache.
 - Single XPU device per process.
-- Validated on Arc Pro B70 only. The default `bmg` build also runs on other BMG cards (e.g. Arc B580),
-  where it is enabled by default but untested; set `MONO_DECODE_XPU=0` if anything looks wrong.
+- Performance is validated on Arc Pro B70. Arc B580 (20 Xe cores; launches size themselves to the
+  core count) has been checked functionally in a development environment. Other BMG cards run the
+  same `bmg` build untested; set `MONO_DECODE_XPU=0` if anything looks wrong.
 
 ## License
 

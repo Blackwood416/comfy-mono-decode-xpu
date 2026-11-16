@@ -42,24 +42,34 @@ inline auto lptr(T* p) {
     return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
 }
 
+// Device-wide barrier of the resident work-groups, with the fences spelled out per role. Written as
+// all-thread acq_rel device fences, it compiled to one of two forms depending on unrelated code elsewhere
+// in the kernel (IGC fence coalescing): group-scope fences on all threads plus thread 0's device fences
+// (fast), or a device acquire, i.e. an L1 invalidate (fence.ugm.invalidate.gpu), on every sub-group on both
+// sides of every barrier, 6-8 us more per phase. This is the fast form, explicitly: every thread's stores
+// are released to its work-group (they are in the Xe core's L1-to-L2 path ahead of thread 0's device
+// release, the form the persistent kernels have run and been checked bit for bit with); thread 0 arrives,
+// polls and acquires once for the work-group, whose threads share the core's L1 and read other
+// work-groups' data only after the second barrier.
 inline void grid_sync(sycl::nd_item<1>& it, uint32_t* counter, uint32_t nwg, uint32_t& epoch) {
-    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::work_group);
     sycl::group_barrier(it.get_group());
     if (it.get_local_id(0) == 0) {
-        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
                          sycl::access::address_space::global_space>
             a(*counter);
         const uint32_t target = (++epoch) * nwg;
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
         a.fetch_add(1u);
         // poll with an atomic RMW: a plain atomic load can be served stale and never observe
         // the other work-groups' arrivals on Xe2 (measured hang); RMW polling costs ~0.4 us/barrier
         while (a.fetch_add(0u) < target) {
         }
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
     } else {
         ++epoch;
     }
     sycl::group_barrier(it.get_group());
-    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
 }
 
 // the EU math.rsqt (what ESIMD rsqrt lowers to); SPMD sycl::native::rsqrt lowering varies by build
@@ -76,36 +86,58 @@ inline float hw_rsqrt(float x) {
 using LPtrU16 = sycl::multi_ptr<uint16_t, sycl::access::address_space::local_space, sycl::access::decorated::no>;
 using LPtrF = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>;
 constexpr int TAB = 128 * 256;
+// TAB: pair table [fp8 scale byte < 0x80][two packed codes] -> two INT8 values.
+// ACC: minimum SLM split-K accumulators (64 tiles x 128); plan_streams grows them to a launch's share.
 constexpr int ACC = 64 * 128;
-static_assert(MWG == 1024, "pair table build assumes 1024 threads");            // SLM split-K accumulators: up to 64 tiles per work-group           // pair table: [fp8 scale byte < 0x80][two packed codes] -> two INT8 values
+static_assert(MWG == 1024, "pair table build assumes 1024 threads");
 
-// exact pair table for one codebook: entry (s << 8 | byte) holds the INT8-grid values of the low and
-// high nibble codes of `byte` at FP8 scale byte s, computed with the dec4 formula
+// Exact pair table for one codebook: entry (s << 8 | byte) holds the INT8-grid values of the low and
+// high nibble codes of `byte` at FP8 scale byte s, computed with the dec4 formula.
+// One INT8-grid value of the dec4 formula (code value c at FP8 scale `scale`), as an unsigned byte.
+inline uint32_t pair_code(float c, float scale) {
+    const float r = sycl::rint(c * scale);
+    const int32_t q = sycl::isnan(r) ? 0 : static_cast<int32_t>(sycl::clamp(r, -127.f, 127.f));
+    return uint32_t(q & 0xFF);
+}
+
+// The pair table depends only on the codebook. A kernel fills a global copy (TAB uint16) at its start,
+// spread over all its work-groups (one entry per thread), and after the next grid sync every
+// work-group loads it into SLM with 16 B moves from L2: about 0.3 us instead of computing all 32768
+// entries in each work-group (about 3 us, on the critical path of every GEMV phase).
+template <typename CB>
+inline void build_pair_table_global(sycl::nd_item<1>& it, uint16_t* gtab, const CB& cb, uint32_t wg, uint32_t nw) {
+    const int t = it.get_local_id(0);
+    for (int i = int(wg) * MWG + t; i < TAB; i += int(nw) * MWG) {
+        const int byte = i & 255;
+        const float scale = static_cast<float>(sycl::bit_cast<fp8>(uint8_t(i >> 8)));
+        gtab[i] = uint16_t(pair_code(cb[byte & 15], scale) | (pair_code(cb[byte >> 4], scale) << 8));
+    }
+}
+// SLM copy of the global table; the caller barriers before use
+inline void load_pair_table(sycl::nd_item<1>& it, LPtrU16 tab, const uint16_t* gtab) {
+    const int t = it.get_local_id(0);
+    const auto* src = reinterpret_cast<const uint32_t*>(gtab);
+    auto* dst = reinterpret_cast<uint32_t*>(tab.get());
+    constexpr int N = TAB / 8 / MWG;  // 16 B moves per thread
+    sycl::vec<uint32_t, 4> v[N];
+#pragma unroll
+    for (int k = 0; k < N; ++k) v[k].load(0, gptr(src + 4 * (t + k * MWG)));
+#pragma unroll
+    for (int k = 0; k < N; ++k) v[k].store(0, lptr(dst + 4 * (t + k * MWG)));
+}
+
+// Each thread owns one byte (t & 255), i.e. a fixed pair of codes, and fills its 32 scale rows
+// (t >> 8) + 4j directly from registers: no staged singles, no SLM gathers, no internal barrier.
+// Every entry is the same dec4 expression as the staged build. The caller barriers before use.
 template <typename CB>
 inline void build_pair_table(sycl::nd_item<1>& it, LPtrU16 tab, const CB& cb) {
-    // singles [128 scale bytes][16 codes] (the dec4 formula), staged in the upper half of the table
-    // region that the pair pass fills last
-    const int t = it.get_local_id(0);
-    auto single = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-        reinterpret_cast<uint8_t*>(tab.get()) + 2 * TAB - 2048);
-    for (int i = t; i < 2048; i += MWG) {
-        const float scale = static_cast<float>(sycl::bit_cast<fp8>(uint8_t(i >> 4)));
-        const float r = sycl::rint(cb[i & 15] * scale);
-        const int32_t q = sycl::isnan(r) ? 0 : static_cast<int32_t>(sycl::clamp(r, -127.f, 127.f));
-        single[i] = static_cast<uint8_t>(q & 0xFF);
+    const int t = it.get_local_id(0), byte = t & 255;
+    const float clo = cb[byte & 15], chi = cb[byte >> 4];
+#pragma unroll 4
+    for (int s = t >> 8; s < 128; s += MWG / 256) {
+        const float scale = static_cast<float>(sycl::bit_cast<fp8>(uint8_t(s)));
+        tab[(s << 8) | byte] = uint16_t(pair_code(clo, scale) | (pair_code(chi, scale) << 8));
     }
-    sycl::group_barrier(it.get_group());
-    // pairs: entries [0, TAB - 1024) never overlap the singles' bytes; the last 1024 entries are
-    // computed into registers first, then written after a barrier
-    uint16_t tail = 0;
-    for (int i = t; i < TAB; i += MWG) {
-        const int s = i >> 8, byte = i & 255;
-        const uint16_t v = uint16_t(single[s * 16 + (byte & 15)]) | uint16_t(uint16_t(single[s * 16 + (byte >> 4)]) << 8);
-        if (i < TAB - 1024) tab[i] = v;
-        else tail = v;
-    }
-    sycl::group_barrier(it.get_group());
-    if (TAB - 1024 + t < TAB && t < 1024) tab[TAB - 1024 + t] = tail;
 }
 
 // ---- stream GEMV engine ---------------------------------------------------------------------------
