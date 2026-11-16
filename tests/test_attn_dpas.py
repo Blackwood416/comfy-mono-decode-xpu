@@ -44,6 +44,7 @@ def _kitchen(q, k, v, sl, xk, xv, mask_t):
     (63, 4096, [-1, 0, 1, 2, 3, 4, 5, 6]),
     (777, 4096, [-1, 0, 0, 0, 0, 1, 1, 1]),
     (3500, 11400, [-1, 0, 1, 2, 3, 4, 5, 6]),
+    (4096, 12416, [-1, 0, 1, 2, 3, 4, 5]),  # B580's largest query pack, seven live rows
     (11392, 11400, [-1, 0, 0, 1, 1]),  # last full tile before the cache-capacity tail
     (11400, 11400, [-1, 0, 1, 2, 3, 4, 5, 6]),  # actual partial capacity tile, all verify rows
     (1000, 4096, None),  # the MTP draft's single row, no tree
