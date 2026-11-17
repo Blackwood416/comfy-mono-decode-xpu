@@ -14,14 +14,18 @@ be run by hand (``python install.py``) or through ``install.sh``.
 """
 import argparse
 import glob
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
 import sysconfig
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SO = os.path.join(HERE, "comfy_mono_decode_xpu", "_C" + sysconfig.get_config_var("EXT_SUFFIX"))
+SO = os.path.join(HERE, "comfy_mono_decode_xpu", "_C" + (sysconfig.get_config_var("EXT_SUFFIX") or (".pyd" if sys.platform == "win32" else ".so")))
+PREBUILT_REPO = os.environ.get("MONO_DECODE_XPU_PREBUILT_REPO", "Blackwood416/comfy-mono-decode-xpu")
+PREBUILT_TAG = os.environ.get("MONO_DECODE_XPU_PREBUILT_TAG", "v0.1.0+torch215.dg2.1")
 
 
 def log(msg):
@@ -49,10 +53,84 @@ def build_command():
     return None
 
 
+def _is_dg2_device(torch_mod):
+    try:
+        props = torch_mod.xpu.get_device_properties(0)
+        # DG2/Alchemist (A770/A750/A580/A380): 64 KB SLM and SG8 support; BMG/Xe2 has 128+ KB SLM and no SG8.
+        sg_sizes = list(getattr(props, "sub_group_sizes", []))
+        if sg_sizes and 8 not in sg_sizes:
+            return False
+        local_mem = int(getattr(props, "local_mem_size", 0) or 0)
+        if local_mem > 65536:
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def _try_download_prebuilt(torch_mod, target):
+    if sys.platform != "win32" or target != "dg2":
+        return False
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".pyd"
+    if sys.version_info[:2] != (3, 13) or ext_suffix != ".cp313-win_amd64.pyd":
+        log(f"no prebuilt binary for Python {sys.version_info.major}.{sys.version_info.minor} ({ext_suffix}); trying source build.")
+        return False
+    torch_ver = str(getattr(torch_mod, "__version__", ""))
+    if not torch_ver.startswith("2.15."):
+        log(f"no prebuilt binary for torch {torch_ver} (prebuilt targets 2.15+xpu); trying source build.")
+        return False
+
+    asset_name = f"_C{ext_suffix}"
+    base_url = f"https://github.com/{PREBUILT_REPO}/releases/download/{PREBUILT_TAG}"
+    asset_url = f"{base_url}/{asset_name}"
+    sums_url = f"{base_url}/SHA256SUMS.txt"
+    tmp_path = SO + ".tmp"
+    try:
+        expected_sha = None
+        try:
+            req = urllib.request.Request(sums_url, headers={"User-Agent": "comfy-mono-decode-xpu-installer"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                for line in resp.read().decode("utf-8", "replace").splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 2 and parts[1].lstrip("*") == asset_name:
+                        expected_sha = parts[0].lower()
+                        break
+        except Exception:
+            pass
+
+        log(f"downloading prebuilt DG2 binary from {asset_url} ...")
+        req = urllib.request.Request(asset_url, headers={"User-Agent": "comfy-mono-decode-xpu-installer"})
+        os.makedirs(os.path.dirname(SO), exist_ok=True)
+        h = hashlib.sha256()
+        with urllib.request.urlopen(req, timeout=120) as resp, open(tmp_path, "wb") as dst:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                h.update(chunk)
+        got_sha = h.hexdigest().lower()
+        if expected_sha and got_sha != expected_sha:
+            raise ValueError(f"SHA-256 mismatch: expected {expected_sha}, got {got_sha}")
+        os.replace(tmp_path, SO)
+        log(f"installed prebuilt {os.path.relpath(SO, HERE)} (sha256={got_sha[:12]})")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"prebuilt download failed ({e}); falling back to local build.")
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--force", action="store_true", help="rebuild even if the extension is up to date")
-    ap.add_argument("--target", help="AOT device for icpx (default bmg)")
+    ap.add_argument("--target", help="AOT device for icpx (default dg2 on Windows, bmg on Linux)")
+    ap.add_argument("--prebuilt", action="store_true", help="download prebuilt Windows DG2 binary even if present")
+    ap.add_argument("--no-prebuilt", action="store_true", help="skip prebuilt binary download and build from source")
     args = ap.parse_args()
 
     try:
@@ -65,8 +143,19 @@ def main():
         log(f"torch not importable ({e}): skipping the build.")
         return 0
 
-    if up_to_date() and not args.force:
+    default_target = "dg2" if (sys.platform == "win32" and _is_dg2_device(torch)) else "bmg"
+    target = args.target or os.environ.get("MONO_DECODE_XPU_XPU_DEVICE") or default_target
+    use_prebuilt = (
+        sys.platform == "win32"
+        and not args.no_prebuilt
+        and os.environ.get("MONO_DECODE_XPU_BUILD_FROM_SOURCE", "0") != "1"
+        and (args.prebuilt or not args.force)
+    )
+
+    if up_to_date() and not args.force and not args.prebuilt:
         log(f"extension up to date: {os.path.relpath(SO, HERE)}")
+    elif use_prebuilt and _try_download_prebuilt(torch, target):
+        pass
     else:
         cmd = build_command()
         if cmd is None:
@@ -74,10 +163,7 @@ def main():
                 "`python install.py` here. Until then decode runs the stock path.")
             return 0
         env = dict(os.environ, PYTHON=sys.executable)
-        if args.target:
-            env["MONO_DECODE_XPU_XPU_DEVICE"] = args.target
-        elif sys.platform == "win32" and "MONO_DECODE_XPU_XPU_DEVICE" not in env:
-            env["MONO_DECODE_XPU_XPU_DEVICE"] = "dg2"
+        env["MONO_DECODE_XPU_XPU_DEVICE"] = target
         if sys.platform == "win32":
             env["TORCH_DIR"] = os.path.dirname(torch.__file__)
             env["EXT_SUFFIX"] = sysconfig.get_config_var("EXT_SUFFIX") or ".pyd"
@@ -102,8 +188,7 @@ def main():
                         break
             env.setdefault("MONO_PY_INCLUDE", py_inc)
             env.setdefault("MONO_PY_LIB", py_lib)
-        default_target = "dg2" if sys.platform == "win32" else "bmg"
-        log(f"building for {env.get('MONO_DECODE_XPU_XPU_DEVICE', default_target)} (single icpx invocation)")
+        log(f"building for {target} (single icpx invocation)")
         if subprocess.call(cmd, cwd=HERE, env=env) != 0:
             log("build failed (see the compiler output above). Decode runs the stock path.")
             return 0
