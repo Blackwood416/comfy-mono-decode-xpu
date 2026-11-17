@@ -99,15 +99,44 @@ def _try_download_prebuilt(torch_mod, target):
             pass
 
         log(f"downloading prebuilt DG2 binary from {asset_url} ...")
-        req = urllib.request.Request(asset_url, headers={"User-Agent": "comfy-mono-decode-xpu-installer"})
         os.makedirs(os.path.dirname(SO), exist_ok=True)
+        downloaded = 0
+        total_len = None
+        for attempt in range(6):
+            headers = {"User-Agent": "comfy-mono-decode-xpu-installer"}
+            if downloaded > 0:
+                headers["Range"] = f"bytes={downloaded}-"
+            req = urllib.request.Request(asset_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    if downloaded > 0 and resp.status == 200:
+                        downloaded = 0
+                    if total_len is None:
+                        cl = resp.headers.get("Content-Length")
+                        if cl and cl.isdigit():
+                            total_len = downloaded + int(cl)
+                    mode = "ab" if downloaded > 0 else "wb"
+                    with open(tmp_path, mode) as dst:
+                        while True:
+                            chunk = resp.read(256 * 1024)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                            downloaded += len(chunk)
+            except Exception:
+                if attempt == 5:
+                    raise
+            if total_len is None or downloaded >= total_len:
+                break
+        if total_len is not None and downloaded != total_len:
+            raise ValueError(f"incomplete download: {downloaded}/{total_len} bytes")
+
         h = hashlib.sha256()
-        with urllib.request.urlopen(req, timeout=120) as resp, open(tmp_path, "wb") as dst:
+        with open(tmp_path, "rb") as f:
             while True:
-                chunk = resp.read(1024 * 1024)
+                chunk = f.read(1024 * 1024)
                 if not chunk:
                     break
-                dst.write(chunk)
                 h.update(chunk)
         got_sha = h.hexdigest().lower()
         if expected_sha and got_sha != expected_sha:
