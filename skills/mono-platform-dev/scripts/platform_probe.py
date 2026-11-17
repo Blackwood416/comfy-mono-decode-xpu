@@ -18,12 +18,9 @@ from pathlib import Path
 REPO = next((p for p in Path(__file__).resolve().parents if (p / "comfy_mono_decode_xpu").is_dir()),
             Path(__file__).resolve().parent)
 
-# Device ids seen during development. Anything else is unvalidated, not unsupported.
+# The validated reference device. Anything else is unvalidated, not unsupported.
 KNOWN = {
-    0xE223: ("Arc Pro B70", "BMG-G31", "bmg", "development device"),
-    0xE20B: ("Arc B580", "BMG-G21", "bmg", "ported; device-specific attention chunk cap"),
-    0xE211: ("Arc Pro B60", "BMG-G21", "bmg", "ported; no device-specific code"),
-    0x56A0: ("Arc A770", "DG2-G10", None, "not supported by these kernels (see reference/devices.md)"),
+    0xE223: ("Arc Pro B70", "BMG-G31", "bmg", "validated reference device"),
 }
 
 
@@ -130,8 +127,8 @@ def main():
         check("WARN", "multi-xpu", "several XPUs visible: pin the one under test (ZE_AFFINITY_MASK) "
               "and confirm nothing else runs on it")
     if known is None:
-        check("WARN", "device", f"{dev.get('device_id_hex')} is not a development device: run the full "
-              "bring-up (tests, stats, E2E) before trusting numbers")
+        check("WARN", "device", f"{dev.get('device_id_hex')} is not the validated device: establish "
+              "every assumption (reference/platform.md) before trusting a fast path")
     # 6. Build state.
     if not built:
         check("FAIL", "extension", "comfy_mono_decode_xpu/_C* not built: run `python install.py`")
