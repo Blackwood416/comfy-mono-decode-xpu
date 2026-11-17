@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Report the XPU and software stack, and check the assumptions the decode kernels make about the device.
 
 usage: python platform_probe.py [--comfyui DIR] [--node DIR] [--device N] [--json OUT]

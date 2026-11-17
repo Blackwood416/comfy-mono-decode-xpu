@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Per-step device time by kernel family from an XPU-only decode profile (observer MONO_TUNE_PROFILE=N).
 
 usage: python profile_summary.py PROFILE.json [--gdn-per-step 24] [--skip 1]

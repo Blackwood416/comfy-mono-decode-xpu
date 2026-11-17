@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Run a saved ComfyUI workflow on fresh servers, one per switch configuration, and collect decode numbers.
 
 usage:

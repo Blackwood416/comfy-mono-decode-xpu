@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """DRAM read bandwidth of the XPU, the roof for a memory-bound decode step.
 
 usage: python read_bandwidth.py [--gib 2] [--iters 20] [--device N]
@@ -33,6 +34,10 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--device", type=int, default=0)
     a = ap.parse_args()
+    if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+        raise SystemExit("torch.xpu is not available: run this with ComfyUI's Python on the XPU host")
+    if not 0 <= a.device < torch.xpu.device_count():
+        raise SystemExit(f"--device {a.device}: only {torch.xpu.device_count()} XPU(s) visible")
     torch.xpu.set_device(a.device)
     props = torch.xpu.get_device_properties(a.device)
     n = int(a.gib * 2**30) // 4

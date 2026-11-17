@@ -1,7 +1,11 @@
 ---
 name: mono-platform-dev
-description: Use when developing, porting, bringing up or tuning comfy-mono-decode-xpu on an Intel GPU platform other than the one it was validated on (another card, architecture, driver, OS or ComfyUI / Torch stack), or when it underperforms there. Covers checking the platform against the kernels' assumptions, building and testing, confirming which decode paths run, measuring decode against the bandwidth roof, and making platform-specific policy or kernel changes that keep the verify path exact.
+description: Use when developing, porting, bringing up or tuning comfy-mono-decode-xpu on an Intel GPU platform other than the validated one (card, architecture, driver, OS or ComfyUI / Torch stack), or when it underperforms there.
 license: Apache-2.0
+metadata:
+  author: xiangyuT <xiangyu.tian@intel.com>
+  version: "0.1.0"
+  tags: [intel-xpu, sycl, comfyui, decode, porting, benchmarking]
 ---
 
 # Mono decode on another platform
@@ -26,7 +30,13 @@ exactness boundary), `docs/ENV.md` (switches) and `tests/README.md` first.
 - **One piece at a time.** The node's pieces are independent. Each must be correct and no slower
   than stock before the next.
 
-## Steps
+## Prerequisites
+
+- The ComfyUI environment the user runs: Torch with XPU, the oneAPI `icpx` compiler, Kitchen and
+  ComfyUI-OmniXPU.
+- The official workflow exported in API format (frontend: Export (API)), with its models present.
+
+## Instructions
 
 1. **Probe.**
    - Run `python skills/mono-platform-dev/scripts/platform_probe.py --comfyui <ComfyUI>` with
@@ -60,11 +70,29 @@ exactness boundary), `docs/ENV.md` (switches) and `tests/README.md` first.
      for the first and later images, fallbacks, what was tried without effect, and which platforms
      a change was measured on.
 
-## Scripts
+## Examples
 
-| script | purpose |
-|---|---|
-| `scripts/platform_probe.py` | Device properties and stack versions, checked against the kernels' assumptions. |
-| `scripts/read_bandwidth.py` | Sustained device read bandwidth: the roof. |
-| `scripts/bench_workflow.py` | Replays an API-format workflow on fresh servers per configuration and summarizes decode per run. It loads the observer node `scripts/nodes/mono_tune_observer`, which writes per-generate records: tokens, steps, drafts, timings, stats and optional device segments and profile. |
-| `scripts/profile_summary.py` | Per-step device time by kernel family, and idle time, from the observer's profile. |
+```bash
+S=skills/mono-platform-dev/scripts
+python $S/platform_probe.py --comfyui ~/ComfyUI
+python $S/read_bandwidth.py
+python $S/bench_workflow.py --comfyui ~/ComfyUI --workflow template-api.json --out bench/base \
+    --config stock:MONO_DECODE_XPU=0 --config default: --config stock2:MONO_DECODE_XPU=0
+cat bench/base/summary.md
+```
+
+## Available Scripts
+
+| script | purpose | arguments |
+|---|---|---|
+| `scripts/platform_probe.py` | Device properties and stack versions, checked against the kernels' assumptions. | `--comfyui DIR`, `--node DIR`, `--device N`, `--json OUT` |
+| `scripts/read_bandwidth.py` | Sustained device read bandwidth: the roof. | `--gib`, `--iters`, `--device` |
+| `scripts/bench_workflow.py` | Replays an API-format workflow on fresh servers per configuration and summarizes decode per run. It loads the observer node `scripts/nodes/mono_tune_observer`, which writes per-generate records: tokens, steps, drafts, timings, stats and optional device segments and profile. | `--comfyui`, `--workflow`, `--out`, `--config NAME:VAR=V,...` (repeat), `--warmup`, `--runs`, `--pe-only`, `--mtp`, `--launcher`, `--server-args`, `--extra-model-paths`, `--run-timeout`; `--help` for all |
+| `scripts/profile_summary.py` | Per-step device time by kernel family, and idle time, from the observer's profile. | `PROFILE.json`, `--gdn-per-step`, `--skip` |
+
+## Limitations
+
+- Validated on one platform, the Arc Pro B70 (Xe2); everything else is to be established.
+- The observer and the benchmark target ComfyUI's Qwen3.5 `generate` interface, and
+  `profile_summary.py` assumes Qwen3.5-9B's layer mix. A different ComfyUI version or model needs
+  them checked first.
