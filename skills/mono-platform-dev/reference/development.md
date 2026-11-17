@@ -2,12 +2,16 @@
 
 ## Contract
 
-- **Verify path:** bitwise identical to the operator chain it replaces on the target platform, for
-  the same inputs, weights, dtype and layout (docs/DESIGN.md, Exactness). A platform change may
-  move work between threads and in time, but must not change the arithmetic or its order.
+- **Verify path, except decode attention:** bitwise identical to the operator chain it replaces
+  on the target platform, for the same inputs, weights, dtype and layout (docs/DESIGN.md,
+  Exactness). A platform change may move work between threads and in time, but must not change
+  the arithmetic or its order.
 - **Decode attention:** within the fp64-referenced error bound, with the replaced kernel's own
-  error as the limit.
+  error on the same inputs as the limit; `MONO_DECODE_XPU_ATTN_DPAS=0` keeps the bit-identical
+  port available.
 - **Drafts:** may differ, judged by acceptance and the outputs; the verify decides every token.
+- **New exceptions:** a maintainer decision, not a platform-local one. It needs a stated acceptance
+  criterion, an entry in docs/DESIGN.md and a switch back to the exact path.
 - **Errors:** stateful dispatch (after KV, the recurrent state or x may have been written)
   propagates errors. Pure operations may disable their own route and fall back. Cancellation
   never disables a path.

@@ -11,8 +11,12 @@ repository root. Read `docs/DESIGN.md` (what each kernel does, the exactness bou
 
 ## Principles
 
-- **Exactness first.** The verify path stays bitwise identical to what it replaces on this
-  platform. Speed never buys an exception.
+- **Exactness is the default contract.** Verify-path kernels give the same bits as the operator
+  chain they replace on this platform, for the same inputs, weights, dtype and layout; the tests
+  check exactly that. The documented exceptions (decode attention, held to an fp64-referenced
+  error bound, and the draft path, judged by acceptance) carry their own criteria. A new exception
+  is a maintainer decision with a stated acceptance criterion, a DESIGN entry and a switch back to
+  the exact path; it is never a local trade for speed.
 - **Establish, don't assume.** Every assumption the code makes about the device and the stack is
   checked on the target, and every claim rests on a measurement in the real workflow there.
 - **Small, gated changes.** Platform-specific behaviour sits behind a device or capability gate.
