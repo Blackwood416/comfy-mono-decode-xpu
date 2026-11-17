@@ -175,28 +175,36 @@ namespace jm = sycl::ext::oneapi::experimental::matrix;
 template <typename Scale, typename Out, bool FAST, int Split>
 class W4A8DpasKernel;
 
+#ifdef MONO_DECODE_XPU_DG2
+constexpr int kDpasSG = 8;
+constexpr int kDpasN = 8;
+#else
+constexpr int kDpasSG = 16;
+constexpr int kDpasN = 16;
+#endif
+
 template <typename Scale, typename Out, bool FAST, int Split>
 void launch_dpas(const int8_t* x, const float* xs, const int8_t* w, const Scale* srel, const float* sch,
                  const float* codebook, const Out* residual, Out* out, int64_t N, int64_t K, int64_t G,
                  sycl::queue& q) {
-    const int64_t tiles = (N + 15) / 16;
+    const int64_t tiles = (N + kDpasN - 1) / kDpasN;
     const int64_t groups_per_row = K / G;
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<int32_t, 1> partials(Split * 8 * 16, h);
+        sycl::local_accessor<int32_t, 1> partials(Split * 8 * kDpasN, h);
         sycl::local_accessor<float, 1> cb(16, h);
         h.parallel_for<W4A8DpasKernel<Scale, Out, FAST, Split>>(
-            sycl::nd_range<1>(tiles * Split * 16, Split * 16),
-            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            sycl::nd_range<1>(tiles * Split * kDpasSG, Split * kDpasSG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kDpasSG)]] {
                 auto sg = it.get_sub_group();
-                const int split = it.get_local_id(0) / 16;
-                const int lane = it.get_local_id(0) % 16;
-                if (it.get_local_id(0) < 16) cb[lane] = codebook ? codebook[lane] : float(lane - 8);
+                const int split = it.get_local_id(0) / kDpasSG;
+                const int lane = it.get_local_id(0) % kDpasSG;
+                if (it.get_local_id(0) < 16) cb[it.get_local_id(0)] = codebook ? codebook[it.get_local_id(0)] : float(int(it.get_local_id(0)) - 8);
                 sycl::group_barrier(it.get_group());
-                const int64_t column = it.get_group(0) * 16 + lane;
+                const int64_t column = it.get_group(0) * kDpasN + lane;
                 const int64_t ncol = column < N ? column : N - 1;
                 jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> a;
-                jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> b;
-                jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16> c;
+                jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, kDpasN, jm::layout::ext_intel_packed> b;
+                jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, kDpasN> c;
                 jm::joint_matrix_fill(sg, c, 0);
                 const int8_t* wrow = w + ncol * (K / 2);
                 const Scale* srow = srel + ncol * groups_per_row;
@@ -224,24 +232,33 @@ void launch_dpas(const int8_t* x, const float* xs, const int8_t* w, const Scale*
                         if constexpr (FAST) dec[j] = decode4_fast(packet[j / 2], (j & 1) * 4, cb, j < 4 ? s0 : s1);
                         else dec[j] = decode4(packet[j / 2], (j & 1) * 4, cb, j < 4 ? s0 : s1);
                     }
+#ifdef MONO_DECODE_XPU_DG2
+                    {
+                        auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, b);
+#pragma unroll
+                        for (int i = 0; i < 32; ++i)
+                            wd[i] = static_cast<int8_t>((dec[i >> 2] >> (8 * (i & 3))) & 0xFF);
+                    }
+#else
                     int e = 0;
                     jm::joint_matrix_apply(sg, b, [&](int8_t& v) {
                         const int i = e++;
                         v = static_cast<int8_t>((dec[i >> 2] >> (8 * (i & 3))) & 0xFF);
                     });
+#endif
                     jm::joint_matrix_mad(sg, c, a, b, c);
                 }
                 auto local = sycl::address_space_cast<sycl::access::address_space::local_space,
                                                       sycl::access::decorated::no>(
-                    partials.template get_multi_ptr<sycl::access::decorated::no>().get() + split * 128);
-                jm::joint_matrix_store(sg, c, local, 16, jm::layout::row_major);
+                    partials.template get_multi_ptr<sycl::access::decorated::no>().get() + split * (8 * kDpasN));
+                jm::joint_matrix_store(sg, c, local, kDpasN, jm::layout::row_major);
                 sycl::group_barrier(it.get_group());
-                for (int i = it.get_local_id(0); i < 128; i += Split * 16) {
+                for (int i = it.get_local_id(0); i < 8 * kDpasN; i += Split * kDpasSG) {
                     uint32_t sum = 0;
 #pragma unroll
-                    for (int t = 0; t < Split; ++t) sum += static_cast<uint32_t>(partials[t * 128 + i]);
-                    const int r = i / 16;
-                    const int64_t n = it.get_group(0) * 16 + i % 16;
+                    for (int t = 0; t < Split; ++t) sum += static_cast<uint32_t>(partials[t * (8 * kDpasN) + i]);
+                    const int r = i / kDpasN;
+                    const int64_t n = it.get_group(0) * kDpasN + i % kDpasN;
                     if (n < N) {
                         float f = static_cast<float>(sycl::bit_cast<int32_t>(sum));
                         f = f * xs[r];
@@ -270,7 +287,7 @@ void dispatch(const torch::Tensor& x, const torch::Tensor& xs, const torch::Tens
         int64_t split = cfg >= 100 ? cfg - 100 : 0;
         if (split == 0) {
             const auto units = q.get_device().get_info<sycl::info::device::max_compute_units>();
-            split = (N + 15) / 16 < int64_t(units) ? 16 : 8;
+            split = (N + kDpasN - 1) / kDpasN < int64_t(units) ? 16 : 8;
         }
         auto go = [&](auto s) {
             constexpr int S = decltype(s)::value;

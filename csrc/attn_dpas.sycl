@@ -71,6 +71,139 @@ inline void chunking(int L, int chunks, int& per, int& active) {
     active = L > 0 ? (L + per - 1) / per : 0;
 }
 
+#ifdef MONO_DECODE_XPU_DG2
+template <int NMT>
+void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16* Vc, const int* lens, int HK,
+                     int groups, int S, int rows, int cap, int chunks, float* part, float* ml) {
+    constexpr int QTR = HD / 4;
+    constexpr int NT_DG2 = QTR / 8;
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> qs(NMT * 8 * HD, cgh);
+        sycl::local_accessor<bf16, 1> scratch(NMT * 4 * (8 * 16 + 16 * 16), cgh);
+        cgh.parallel_for<AttnDpasPartK<NMT>>(
+            sycl::nd_range<1>(int64_t(HK) * chunks * NMT * 32, NMT * 32),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(8)]] {
+                auto sg = it.get_sub_group();
+                const int t = it.get_local_id(0), lane = sg.get_local_id()[0], sgi = t / 8;
+                const int mt = sgi / 4, dh = sgi % 4;
+                const int wg = it.get_group(0), kh = wg / chunks, c = wg % chunks;
+                const int64_t raw = lens[0];
+                const int L = raw < 0 ? 0 : (raw > cap ? cap : int(raw));
+                int per, active;
+                chunking(L, chunks, per, active);
+                if (c >= active) return;
+                const int beg = c * per, end = sycl::min(L, beg + per);
+                for (int i = t; i < NMT * 8 * HD; i += NMT * 32) {
+                    const int r = i / HD, d = i % HD;
+                    qs[i] = r < rows ? bf16(Q.at(0, kh * groups + r / S, r % S, d)) : bf16(0.f);
+                }
+                sycl::group_barrier(it.get_group());
+                bf16* pslm = &scratch[sgi * (8 * 16 + 16 * 16)];
+                bf16* stage = pslm + 8 * 16;
+                float ml_m = -INFINITY, ml_l = 0.f;
+                jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 8> o[NT_DG2];
+#pragma unroll
+                for (int n = 0; n < NT_DG2; ++n) jm::joint_matrix_fill(sg, o[n], 0.f);
+                const bf16* kbase = Kc + int64_t(kh) * cap * HD;
+                const bf16* vbase = Vc + int64_t(kh) * cap * HD;
+                auto run_loop = [&](auto full_tag) {
+                    constexpr bool ALWAYS_FULL = decltype(full_tag)::value;
+                    for (int tb = beg; tb < end; tb += TT) {
+                        const bool full = ALWAYS_FULL || (tb + TT <= cap);
+                        jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 8> s0, s1;
+                        jm::joint_matrix_fill(sg, s0, 0.f);
+                        jm::joint_matrix_fill(sg, s1, 0.f);
+#pragma unroll 2
+                        for (int dc = 0; dc < HD / 16; ++dc) {
+                            jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a;
+                            jm::joint_matrix_load(sg, a, lp(&qs[(mt * 8) * HD + dc * 16]), HD);
+                            jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 8, jm::layout::col_major> b0, b1;
+                            if (full) {
+                                jm::joint_matrix_load(sg, b0, gp(kbase + int64_t(tb) * HD + dc * 16), HD);
+                                jm::joint_matrix_load(sg, b1, gp(kbase + int64_t(tb + 8) * HD + dc * 16), HD);
+                            } else {
+                                for (int e = 0; e < 16; ++e)
+                                    stage[lane * 16 + e] = tb + lane < cap ? kbase[int64_t(tb + lane) * HD + dc * 16 + e] : bf16(0.f);
+                                sycl::group_barrier(sg);
+                                jm::joint_matrix_load(sg, b0, lp(stage), 16);
+                                sycl::group_barrier(sg);
+                                for (int e = 0; e < 16; ++e)
+                                    stage[lane * 16 + e] = tb + 8 + lane < cap ? kbase[int64_t(tb + 8 + lane) * HD + dc * 16 + e] : bf16(0.f);
+                                sycl::group_barrier(sg);
+                                jm::joint_matrix_load(sg, b1, lp(stage), 16);
+                                sycl::group_barrier(sg);
+                            }
+                            jm::joint_matrix_mad(sg, s0, a, b0, s0);
+                            jm::joint_matrix_mad(sg, s1, a, b1, s1);
+                        }
+                        float sv0[8], sv1[8];
+                        {
+                            auto w0 = sycl::ext::oneapi::detail::get_wi_data(sg, s0);
+                            auto w1 = sycl::ext::oneapi::detail::get_wi_data(sg, s1);
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) { sv0[i] = w0[i]; sv1[i] = w1[i]; }
+                        }
+                        float alpha[8];
+                        const bool live0 = (tb + lane) < end;
+                        const bool live1 = (tb + 8 + lane) < end;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const float v0 = live0 ? sv0[i] * SCALE : -INFINITY;
+                            const float v1 = live1 ? sv1[i] * SCALE : -INFINITY;
+                            const float mx = sycl::fmax(sycl::reduce_over_group(sg, v0, sycl::maximum<float>()),
+                                                        sycl::reduce_over_group(sg, v1, sycl::maximum<float>()));
+                            const float mi = sycl::group_broadcast(sg, ml_m, i), li = sycl::group_broadcast(sg, ml_l, i);
+                            const float mn = sycl::fmax(mi, mx);
+                            alpha[i] = mi == -INFINITY ? 0.f : sycl::exp(mi - mn);
+                            const float p0 = v0 == -INFINITY ? 0.f : sycl::exp(v0 - mn);
+                            const float p1 = v1 == -INFINITY ? 0.f : sycl::exp(v1 - mn);
+                            const float rs = sycl::reduce_over_group(sg, p0, sycl::plus<float>()) +
+                                             sycl::reduce_over_group(sg, p1, sycl::plus<float>());
+                            if (lane == i) { ml_m = mn; ml_l = li * alpha[i] + rs; }
+                            pslm[i * 16 + lane] = bf16(p0);
+                            pslm[i * 16 + 8 + lane] = bf16(p1);
+                        }
+                        sycl::group_barrier(sg);
+                        jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> pa;
+                        jm::joint_matrix_load(sg, pa, lp(pslm), 16);
+#pragma unroll
+                        for (int n = 0; n < NT_DG2; ++n) {
+                            {
+                                auto w = sycl::ext::oneapi::detail::get_wi_data(sg, o[n]);
+#pragma unroll
+                                for (int i = 0; i < 8; ++i) w[i] = float(w[i]) * alpha[i];
+                            }
+                            jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 8, jm::layout::row_major> vb;
+                            const bf16* vp = vbase + int64_t(tb) * HD + dh * QTR + n * 8;
+                            if (full) {
+                                jm::joint_matrix_load(sg, vb, gp(vp), HD);
+                            } else {
+                                for (int e = 0; e < 16; ++e)
+                                    stage[e * 8 + lane] = tb + e < cap ? vp[int64_t(e) * HD + lane] : bf16(0.f);
+                                sycl::group_barrier(sg);
+                                jm::joint_matrix_load(sg, vb, lp(stage), 8);
+                                sycl::group_barrier(sg);
+                            }
+                            jm::joint_matrix_mad(sg, o[n], pa, vb, o[n]);
+                        }
+                        sycl::group_barrier(sg);
+                    }
+                };
+                if (L <= (cap / TT) * TT) run_loop(std::true_type{});
+                else run_loop(std::false_type{});
+                const int64_t unit = int64_t(kh) * chunks + c;
+#pragma unroll
+                for (int n = 0; n < NT_DG2; ++n)
+                    jm::joint_matrix_store(sg, o[n], gp(part + (unit * NMT * 8 + mt * 8) * HD + dh * QTR + n * 8), HD,
+                                           jm::layout::row_major);
+                if (dh == 0) {
+                    ml[((unit * NMT * 8) + mt * 8 + lane) * 2] = ml_m;
+                    ml[((unit * NMT * 8) + mt * 8 + lane) * 2 + 1] = ml_l;
+                }
+            });
+    });
+}
+#else
 template <int NMT>
 void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16* Vc, const int* lens, int HK,
                      int groups, int S, int rows, int cap, int chunks, float* part, float* ml) {
@@ -264,6 +397,7 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
             });
     });
 }
+#endif
 }  // namespace
 
 torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,

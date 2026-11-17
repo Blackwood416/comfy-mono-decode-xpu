@@ -57,7 +57,8 @@ def _install():
     if not any(_on(p) for p in _DEFAULTS):
         return
     here = os.path.dirname(os.path.realpath(__file__))
-    if not glob.glob(os.path.join(here, "comfy_mono_decode_xpu", "_C*.so")):
+    if not (glob.glob(os.path.join(here, "comfy_mono_decode_xpu", "_C*.so"))
+            or glob.glob(os.path.join(here, "comfy_mono_decode_xpu", "_C*.pyd"))):
         logging.warning("[mono_decode_xpu] extension not built: run `python install.py` in %s. "
                         "Decode runs the stock path.", here)
         return

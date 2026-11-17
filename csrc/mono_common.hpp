@@ -15,8 +15,15 @@ namespace mono {
 using bf16 = sycl::ext::oneapi::bfloat16;
 using fp8 = c10::Float8_e4m3fn;
 namespace jm = sycl::ext::oneapi::experimental::matrix;
+#ifdef MONO_DECODE_XPU_DG2
+constexpr int MWG = 512;                 // threads per work-group (64 sub-groups of 8 on DG2)
+constexpr int SG_SZ = 8;
+constexpr int MSG = MWG / SG_SZ;
+#else
 constexpr int MWG = 1024;                // threads per work-group (64 sub-groups: all hardware threads of an Xe core)
-constexpr int MSG = MWG / 16;
+constexpr int SG_SZ = 16;
+constexpr int MSG = MWG / SG_SZ;
+#endif
 constexpr int GS = 256;                  // ConvRot group
 constexpr int MAXK = 12288;
 
@@ -74,22 +81,25 @@ inline void grid_sync(sycl::nd_item<1>& it, uint32_t* counter, uint32_t nwg, uin
 
 // the EU math.rsqt (what ESIMD rsqrt lowers to); SPMD sycl::native::rsqrt lowering varies by build
 inline float hw_rsqrt(float x) {
-#if defined(__SYCL_DEVICE_ONLY__)
+#if defined(__SYCL_DEVICE_ONLY__) && !defined(MONO_DECODE_XPU_DG2)
     float r;
     __asm__ volatile("rsqrt (M1, 16) %0(0,0)<1> %1(0,0)<1;1,0>" : "=rw"(r) : "rw"(x));
     return r;
+#elif defined(__SYCL_DEVICE_ONLY__)
+    return sycl::native::rsqrt(x);
 #else
-    return x;
+    return sycl::rsqrt(x);
 #endif
 }
 
 using LPtrU16 = sycl::multi_ptr<uint16_t, sycl::access::address_space::local_space, sycl::access::decorated::no>;
+using GPtrU16 = sycl::multi_ptr<const uint16_t, sycl::access::address_space::global_space, sycl::access::decorated::no>;
 using LPtrF = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>;
 constexpr int TAB = 128 * 256;
 // TAB: pair table [fp8 scale byte < 0x80][two packed codes] -> two INT8 values.
 // ACC: minimum SLM split-K accumulators (64 tiles x 128); plan_streams grows them to a launch's share.
 constexpr int ACC = 64 * 128;
-static_assert(MWG == 1024, "pair table build assumes 1024 threads");
+static_assert(MWG == 1024 || MWG == 512, "pair table build assumes 512 or 1024 threads");
 
 // Exact pair table for one codebook: entry (s << 8 | byte) holds the INT8-grid values of the low and
 // high nibble codes of `byte` at FP8 scale byte s, computed with the dec4 formula.
@@ -195,9 +205,9 @@ inline int stream_which(const Stream& st, int g, int& tile) {
 #ifndef ROW_W
 #define ROW_W 4
 #endif
-template <int VAR, int W, typename ACC>
+template <int VAR, int W, typename TABP, typename ACC>
 inline void stream_gemv_impl(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st, int64_t t0_, int64_t t1_,
-                             LPtrU16 tab, ACC acc) {
+                             TABP tab, ACC acc) {
     auto sg = it.get_sub_group();
     const int lane = sg.get_local_id()[0], sgi = sg.get_group_id()[0];
     // 32-bit index math throughout; ksplit is a power of two (shift/mask, no division)
@@ -224,6 +234,119 @@ inline void stream_gemv_impl(sycl::nd_item<1>& it, const int8_t* xq, const Strea
         which = stream_which(st, g, tile);
         return int64_t(tile);
     };
+#ifdef MONO_DECODE_XPU_DG2
+    auto wptr = [&](int lu, int ls, int h) {
+        const int u = ubeg + lu;
+        int which;
+        const int64_t tile = tile_of(u, which);
+        const int kk = (u & kmask) * klen + ls * 32;
+        const int8_t* q = which == 0 ? q0 : (which == 1 ? q1 : q2);
+        const int col = lane + h * 8;
+        return reinterpret_cast<const uint32_t*>(tiled ? q + ((tile * (K / 32) + kk / 32) * 16 + col) * 16
+                                                       : q + (tile * 16 + col) * (K / 2) + kk / 2);
+    };
+    auto sptr = [&](int su, int sb, int h) {
+        const int u = ubeg + su;
+        int which;
+        const int64_t tile = tile_of(u, which);
+        const int kk = (u & kmask) * klen + sb * 256;
+        const fp8* s = which == 0 ? s0 : (which == 1 ? s1 : s2);
+        const int col = lane + h * 8;
+        return reinterpret_cast<const uint32_t*>(tiled ? s + ((tile * (K / 256) + kk / 256) * 16 + col) * 16
+                                                       : s + (tile * 16 + col) * (K / 16) + kk / 16);
+    };
+    constexpr int PF = 4;
+    constexpr int NS = PF / W > 1 ? PF / W : 2;
+    sycl::vec<uint32_t, 4 * W> ring[2][NS];
+    sycl::vec<uint32_t, 4> scur[2], snxt[2];
+    int lu = 0, ls = 0, su = 0, sb = 0;
+    auto advance_w = [&]() { ls += W; if (ls == steps) { ls = 0; ++lu; } };
+    auto advance_s = [&]() { if (++sb == blocks) { sb = 0; ++su; } };
+#pragma unroll
+    for (int p = 0; p < NS; ++p)
+        if (p * W < total) {
+            ring[0][p].load(0, gptr(wptr(lu, ls, 0)));
+            ring[1][p].load(0, gptr(wptr(lu, ls, 1)));
+            advance_w();
+        }
+    if (total > 0) {
+        snxt[0].load(0, gptr(sptr(su, sb, 0)));
+        snxt[1].load(0, gptr(sptr(su, sb, 1)));
+        advance_s();
+    }
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> a;
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 8, jm::layout::ext_intel_packed> b;
+    jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 8> c[2];
+    jm::joint_matrix_fill(sg, c[0], 0);
+    jm::joint_matrix_fill(sg, c[1], 0);
+    int cu = 0, cs = 0;
+    for (int i0 = 0; i0 < total; i0 += 8) {
+        scur[0] = snxt[0];
+        scur[1] = snxt[1];
+        if (i0 + 8 < total) {
+            snxt[0].load(0, gptr(sptr(su, sb, 0)));
+            snxt[1].load(0, gptr(sptr(su, sb, 1)));
+            advance_s();
+        }
+#pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int i = i0 + p;
+            const int slot = (p / W) % NS, sub = p % W;
+            sycl::vec<uint32_t, 4> pk[2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int w = 0; w < 4; ++w) pk[h][w] = ring[h][slot][4 * sub + w];
+            if (sub == W - 1 && i + 1 + (NS - 1) * W < total) {
+                ring[0][slot].load(0, gptr(wptr(lu, ls, 0)));
+                ring[1][slot].load(0, gptr(wptr(lu, ls, 1)));
+                advance_w();
+            }
+            const int u = ubeg + cu;
+            const int kk = (u & kmask) * klen + cs * 32;
+            jm::joint_matrix_load(sg, a, gptr(xq + kk), K);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t sc = (scur[h][p >> 1] >> (16 * (p & 1))) & 0xFFFFu;
+                const uint32_t ba = (sc & 0xFFu) << 8, bb = (sc >> 8) << 8;
+                uint32_t d[8];
+                if constexpr (VAR == 1) {
+#pragma unroll
+                    for (int wi = 0; wi < 4; ++wi) { d[2 * wi] = pk[h][wi] ^ ba; d[2 * wi + 1] = pk[h][wi] ^ bb; }
+                } else {
+#pragma unroll
+                    for (int wi = 0; wi < 4; ++wi) {
+                        const uint32_t word = pk[h][wi], base = wi < 2 ? ba : bb;
+                        d[2 * wi] = uint32_t(tab[base | (word & 0xFFu)]) | (uint32_t(tab[base | ((word >> 8) & 0xFFu)]) << 16);
+                        d[2 * wi + 1] = uint32_t(tab[base | ((word >> 16) & 0xFFu)]) | (uint32_t(tab[base | (word >> 24)]) << 16);
+                    }
+                }
+                {
+                    auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, b);
+#pragma unroll
+                    for (int j = 0; j < 32; ++j)
+                        wd[j] = static_cast<int8_t>((d[j >> 2] >> (8 * (j & 3))) & 0xFF);
+                }
+                jm::joint_matrix_mad(sg, c[h], a, b, c[h]);
+            }
+            if (++cs == steps) {
+                cs = 0; ++cu;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int base = (u >> kl2) * 128 + lane + 8 * h;
+                    auto wc = sycl::ext::oneapi::detail::get_wi_data(sg, c[h]);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                         sycl::access::address_space::local_space> ar(acc[base + 16 * j]);
+                        ar.fetch_add(int32_t(wc[j]));
+                    }
+                    jm::joint_matrix_fill(sg, c[h], 0);
+                }
+            }
+        }
+    }
+#else
     auto wptr = [&](int lu, int ls) {
         const int u = ubeg + lu;
         int which;
@@ -306,11 +429,12 @@ inline void stream_gemv_impl(sycl::nd_item<1>& it, const int8_t* xq, const Strea
             }
         }
     }
+#endif
 }
 
-template <int VAR = 0, typename ACC>
+template <int VAR = 0, typename TABP, typename ACC>
 inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st, int64_t t0_, int64_t t1_,
-                        LPtrU16 tab, ACC acc) {
+                        TABP tab, ACC acc) {
     if (st.tiled) stream_gemv_impl<VAR, 1>(it, xq, st, t0_, t1_, tab, acc);
     else stream_gemv_impl<VAR, ROW_W>(it, xq, st, t0_, t1_, tab, acc);
 }
@@ -364,6 +488,61 @@ inline void rot_quant_row(sycl::nd_item<1>& it, const bf16* x, const bf16* h, in
                           LPtrF xr, RED& red) {
     auto sg = it.get_sub_group();
     const int t = it.get_local_id(0), sgi = sg.get_group_id()[0];
+#ifdef MONO_DECODE_XPU_DG2
+    constexpr int TILE_N = 8;
+    const int64_t tiles = (K / GS / 8) * (GS / TILE_N);
+    if constexpr (CompactH) {
+        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 8, jm::layout::row_major> bp_lo, bp_hi, bm_lo, bm_hi;
+        jm::joint_matrix_load(sg, bp_lo, gptr(h), 16);
+        jm::joint_matrix_load(sg, bp_hi, gptr(h + 8), 16);
+        jm::joint_matrix_load(sg, bm_lo, gptr(h + 256), 16);
+        jm::joint_matrix_load(sg, bm_hi, gptr(h + 256 + 8), 16);
+        for (int64_t tile = sgi; tile < tiles; tile += MSG) {
+            const int64_t gb = tile / (GS / TILE_N);
+            const int64_t cb = tile % (GS / TILE_N);
+            const bool hi = (cb & 1) != 0;
+            constexpr int KB = 8;
+            jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a[KB];
+            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 8> c;
+            jm::joint_matrix_fill(sg, c, 0.f);
+            for (int k0 = 0; k0 < GS; k0 += 16 * KB) {
+#pragma unroll
+                for (int u = 0; u < KB; ++u)
+                    jm::joint_matrix_load(sg, a[u], gptr(x + gb * 8 * GS + k0 + 16 * u), GS);
+#pragma unroll
+                for (int u = 0; u < KB; ++u) {
+                    const uint32_t digit_xor = uint32_t((k0 / 16 + u) ^ (cb >> 1));
+                    const bool neg = (sycl::popcount(digit_xor & (digit_xor >> 1) & 0x5u) & 1) != 0;
+                    if (hi)
+                        jm::joint_matrix_mad(sg, c, a[u], neg ? bm_hi : bp_hi, c);
+                    else
+                        jm::joint_matrix_mad(sg, c, a[u], neg ? bm_lo : bp_lo, c);
+                }
+            }
+            jm::joint_matrix_store(sg, c, xr + (gb * 8 * GS + cb * TILE_N), GS, jm::layout::row_major);
+        }
+    } else {
+        for (int64_t tile = sgi; tile < tiles; tile += MSG) {
+            const int64_t gb = tile / (GS / TILE_N);
+            const int64_t cb = tile % (GS / TILE_N);
+            constexpr int KB = 4;
+            jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a[KB];
+            jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 8, jm::layout::row_major> b[KB];
+            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 8> c;
+            jm::joint_matrix_fill(sg, c, 0.f);
+            for (int k0 = 0; k0 < GS; k0 += 16 * KB) {
+#pragma unroll
+                for (int u = 0; u < KB; ++u) {
+                    jm::joint_matrix_load(sg, a[u], gptr(x + gb * 8 * GS + k0 + 16 * u), GS);
+                    jm::joint_matrix_load(sg, b[u], gptr(h + (k0 + 16 * u) * GS + cb * TILE_N), GS);
+                }
+#pragma unroll
+                for (int u = 0; u < KB; ++u) jm::joint_matrix_mad(sg, c, a[u], b[u], c);
+            }
+            jm::joint_matrix_store(sg, c, xr + (gb * 8 * GS + cb * TILE_N), GS, jm::layout::row_major);
+        }
+    }
+#else
     const int64_t tiles = (K / GS / 8) * (GS / 16);
     if constexpr (CompactH) {
         // H256 block (kh,ch) equals +/- its low 16x16 tile, selected by the regular H4 Kronecker sign.
@@ -416,6 +595,7 @@ inline void rot_quant_row(sycl::nd_item<1>& it, const bf16* x, const bf16* h, in
             xr + (gb * 8 * GS + cb * 16), GS, jm::layout::row_major);
     }
     }
+#endif
     sycl::group_barrier(it.get_group());
     float amax = 0.f;
     for (int64_t i = t; i < K; i += MWG) {
@@ -458,10 +638,48 @@ inline void rms_norm_row(sycl::nd_item<1>& it, const bf16* x, const bf16* w, bf1
 #pragma clang fp contract(off)
     auto sg = it.get_sub_group();
     const int t = it.get_local_id(0), lane = sg.get_local_id()[0], sgi = sg.get_group_id()[0];
-    const int et = t >> 5, j0 = t & 31;
     float wv[4096 / MWG];  // the (cold) weight is requested before the reductions
 #pragma unroll
     for (int k = 0; k < 4096 / MWG; ++k) wv[k] = static_cast<float>(w[t + k * MWG]);
+#ifdef MONO_DECODE_XPU_DG2
+    const int j0 = t & 31;
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const int et = pass * 16 + (t >> 5);
+        float v[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int j = j0 + 32 * h;
+            const float x0 = static_cast<float>(x[(2 * et) * 64 + j]);
+            const float x1 = static_cast<float>(x[(2 * et + 1) * 64 + j]);
+            const float p = x0 * x0;
+            v[h] = sycl::fma(x1, x1, p);
+        }
+        red[et * 32 + j0] = v[0] + v[1];
+    }
+    sycl::group_barrier(it.get_group());
+    if (sgi < 32) {
+        const float a0 = red[sgi * 32 + lane] + red[sgi * 32 + lane + 16];
+        const float a1 = red[sgi * 32 + lane + 8] + red[sgi * 32 + lane + 24];
+        float a = a0 + a1;
+        a = a + sycl::shift_group_left(sg, a, 4);
+        a = a + sycl::shift_group_left(sg, a, 2);
+        a = a + sycl::shift_group_left(sg, a, 1);
+        if (lane == 0) red[1024 + sgi] = a * 0.000244140625f;
+    }
+    sycl::group_barrier(it.get_group());
+    if (sgi == 0) {
+        const float a0 = red[1024 + lane] + red[1024 + lane + 16];
+        const float a1 = red[1024 + lane + 8] + red[1024 + lane + 24];
+        float a = a0 + a1;
+        a = a + sycl::shift_group_left(sg, a, 4);
+        a = a + sycl::shift_group_left(sg, a, 2);
+        a = a + sycl::shift_group_left(sg, a, 1);
+        const float scale = hw_rsqrt(sycl::group_broadcast(sg, a, 0) + eps);
+        if (lane == 0) red[1056 - 1] = scale;
+    }
+#else
+    const int et = t >> 5, j0 = t & 31;
     float v[2];
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
@@ -491,6 +709,7 @@ inline void rms_norm_row(sycl::nd_item<1>& it, const bf16* x, const bf16* w, bf1
         const float scale = hw_rsqrt(sycl::group_broadcast(sg, a, 0) + eps);
         if (lane == 0) red[1056 - 1] = scale;
     }
+#endif
     sycl::group_barrier(it.get_group());
     const float scale = red[1056 - 1];
 #pragma unroll

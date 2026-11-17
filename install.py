@@ -31,11 +31,15 @@ def log(msg):
 def up_to_date():
     if not os.path.exists(SO):
         return False
-    srcs = glob.glob(os.path.join(HERE, "csrc", "*")) + [os.path.join(HERE, "build_icpx.sh")]
+    builder = os.path.join(HERE, "build_dg2_win.bat" if sys.platform == "win32" else "build_icpx.sh")
+    srcs = glob.glob(os.path.join(HERE, "csrc", "*")) + [builder]
     return os.path.getmtime(SO) >= max(os.path.getmtime(p) for p in srcs)
 
 
 def build_command():
+    if sys.platform == "win32":
+        script = os.path.join(HERE, "build_dg2_win.bat")
+        return ["cmd", "/c", script]
     script = os.path.join(HERE, "build_icpx.sh")
     if shutil.which("icpx"):
         return ["bash", script]
@@ -72,7 +76,34 @@ def main():
         env = dict(os.environ, PYTHON=sys.executable)
         if args.target:
             env["MONO_DECODE_XPU_XPU_DEVICE"] = args.target
-        log(f"building for {env.get('MONO_DECODE_XPU_XPU_DEVICE', 'bmg')} (single icpx invocation, about 7-8 minutes)")
+        elif sys.platform == "win32" and "MONO_DECODE_XPU_XPU_DEVICE" not in env:
+            env["MONO_DECODE_XPU_XPU_DEVICE"] = "dg2"
+        if sys.platform == "win32":
+            env["TORCH_DIR"] = os.path.dirname(torch.__file__)
+            env["EXT_SUFFIX"] = sysconfig.get_config_var("EXT_SUFFIX") or ".pyd"
+            env["PY_VER"] = f"{sys.version_info.major}{sys.version_info.minor}"
+            py_inc = sysconfig.get_paths()["include"]
+            if not os.path.exists(os.path.join(py_inc, "Python.h")):
+                for cand in (
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", f"Python{env['PY_VER']}", "include"),
+                    os.path.join(r"C:\Program Files", f"Python{env['PY_VER']}", "include"),
+                ):
+                    if os.path.exists(os.path.join(cand, "Python.h")):
+                        py_inc = cand
+                        break
+            py_lib = os.path.join(sysconfig.get_config_var("installed_base") or "", "libs")
+            if not os.path.exists(os.path.join(py_lib, f"python{env['PY_VER']}.lib")):
+                for cand in (
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", f"Python{env['PY_VER']}", "libs"),
+                    os.path.join(r"C:\Program Files", f"Python{env['PY_VER']}", "libs"),
+                ):
+                    if os.path.exists(os.path.join(cand, f"python{env['PY_VER']}.lib")):
+                        py_lib = cand
+                        break
+            env.setdefault("MONO_PY_INCLUDE", py_inc)
+            env.setdefault("MONO_PY_LIB", py_lib)
+        default_target = "dg2" if sys.platform == "win32" else "bmg"
+        log(f"building for {env.get('MONO_DECODE_XPU_XPU_DEVICE', default_target)} (single icpx invocation)")
         if subprocess.call(cmd, cwd=HERE, env=env) != 0:
             log("build failed (see the compiler output above). Decode runs the stock path.")
             return 0

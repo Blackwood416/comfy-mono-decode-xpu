@@ -17,7 +17,11 @@
 
 namespace mono_decode_xpu {
 namespace {
+#ifdef MONO_DECODE_XPU_DG2
+constexpr int TK_WG = 512, TK_K = 8, TK_NW = 32;  // 512*8*8 + 12 = 32780 B <= 64 KB SLM
+#else
 constexpr int TK_WG = 1024, TK_K = 8, TK_NW = 32;
+#endif
 
 // 64-bit rank: larger = better
 inline uint64_t rank_topk(uint16_t bits, uint32_t i) {

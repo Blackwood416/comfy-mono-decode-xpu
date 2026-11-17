@@ -22,30 +22,37 @@ namespace {
 using bf16 = sycl::ext::oneapi::bfloat16;
 namespace jm = sycl::ext::oneapi::experimental::matrix;
 constexpr int GS = 256;      // ConvRot group
-constexpr int PWG = 512;     // threads per row work-group (32 sub-groups)
+constexpr int PWG = 512;     // threads per row work-group
 constexpr int MAXK = 12288;  // SLM row buffer
+#ifdef MONO_DECODE_XPU_DG2
+constexpr int ACT_SG = 8;
+constexpr int ACT_TILE_N = 8;
+#else
+constexpr int ACT_SG = 16;
+constexpr int ACT_TILE_N = 16;
+#endif
 
 class RotQuantDpas;
 
 void launch(const bf16* x, const bf16* h, int8_t* q, float* scale, int64_t rows, int64_t K, sycl::queue& queue) {
     queue.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> xr(MAXK, cgh);
-        sycl::local_accessor<float, 1> red(PWG / 16, cgh);
+        sycl::local_accessor<float, 1> red(PWG / ACT_SG, cgh);
         cgh.parallel_for<RotQuantDpas>(
-            sycl::nd_range<1>(rows * PWG, PWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            sycl::nd_range<1>(rows * PWG, PWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(ACT_SG)]] {
                 auto sg = it.get_sub_group();
                 const int64_t r = it.get_group(0);
                 const int t = it.get_local_id(0);
                 const int sgi = sg.get_group_id()[0];
                 const int64_t groups = K / GS;
-                const int64_t tiles = (groups / 8) * (GS / 16);
+                const int64_t tiles = (groups / 8) * (GS / ACT_TILE_N);
                 const bf16* xrow = x + r * K;
-                for (int64_t tile = sgi; tile < tiles; tile += PWG / 16) {
-                    const int64_t gb = tile / (GS / 16);
-                    const int cb = tile % (GS / 16);
+                for (int64_t tile = sgi; tile < tiles; tile += PWG / ACT_SG) {
+                    const int64_t gb = tile / (GS / ACT_TILE_N);
+                    const int64_t cb = tile % (GS / ACT_TILE_N);
                     jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a;
-                    jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::row_major> b;
-                    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> c;
+                    jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, ACT_TILE_N, jm::layout::row_major> b;
+                    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, ACT_TILE_N> c;
                     jm::joint_matrix_fill(sg, c, 0.f);
                     for (int k = 0; k < GS; k += 16) {
                         jm::joint_matrix_load(
@@ -56,7 +63,7 @@ void launch(const bf16* x, const bf16* h, int8_t* q, float* scale, int64_t rows,
                         jm::joint_matrix_load(
                             sg, b,
                             sycl::address_space_cast<sycl::access::address_space::global_space,
-                                                     sycl::access::decorated::no>(h + k * GS + cb * 16),
+                                                     sycl::access::decorated::no>(h + k * GS + cb * ACT_TILE_N),
                             GS);
                         jm::joint_matrix_mad(sg, c, a, b, c);
                     }
@@ -64,7 +71,7 @@ void launch(const bf16* x, const bf16* h, int8_t* q, float* scale, int64_t rows,
                         sg, c,
                         sycl::address_space_cast<sycl::access::address_space::local_space,
                                                  sycl::access::decorated::no>(
-                            xr.template get_multi_ptr<sycl::access::decorated::no>().get() + gb * 8 * GS + cb * 16),
+                            xr.template get_multi_ptr<sycl::access::decorated::no>().get() + gb * 8 * GS + cb * ACT_TILE_N),
                         GS, jm::layout::row_major);
                 }
                 sycl::group_barrier(it.get_group());
@@ -79,7 +86,7 @@ void launch(const bf16* x, const bf16* h, int8_t* q, float* scale, int64_t rows,
                 sycl::group_barrier(it.get_group());
                 float rmax = 0.f;
 #pragma unroll
-                for (int i = 0; i < PWG / 16; ++i) rmax = sycl::fmax(rmax, red[i]);
+                for (int i = 0; i < PWG / ACT_SG; ++i) rmax = sycl::fmax(rmax, red[i]);
                 const float s = sycl::fmax(rmax / 127.0f, 1e-30f);
                 if (t == 0) scale[r] = s;
                 bf16 sb = static_cast<bf16>(s);
