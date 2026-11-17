@@ -2,7 +2,7 @@
 
 The kernels were written for and validated on Xe2 (Arc Pro B70). On any other platform, answer each
 question below by measurement or by reading the code, before relying on a fast path.
-`scripts/platform_probe.py` answers the first few from device properties.
+The skill's `scripts/platform_probe.py` answers the first few from device properties.
 
 ## Device
 

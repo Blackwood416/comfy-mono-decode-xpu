@@ -413,7 +413,8 @@ pyproject.toml           Comfy Registry metadata
 THIRD_PARTY_NOTICES.md   third-party sources and licenses (full texts in licenses/)
 tests/                   no-model pytest unit tests; UI model-validation instructions
 skills/                  task guides with scripts, for coding agents or people: development, porting
-                         and tuning on other platforms (AGENTS.md and .claude/skills point here)
+                         and tuning on other platforms (AGENTS.md, .agents/skills and .claude/skills
+                         point here)
 ```
 
 ## Limits

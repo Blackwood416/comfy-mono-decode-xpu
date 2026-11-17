@@ -28,7 +28,7 @@
 
 ## Porting
 
-- First confirm what the stock path does on the platform (reference/platform.md).
+- First confirm what the stock path does on the platform (`platform.md`).
 - Bring the node up piece by piece. The pieces in `__init__.py` and the switches in docs/ENV.md are
   independent:
   1. stateless kernels;

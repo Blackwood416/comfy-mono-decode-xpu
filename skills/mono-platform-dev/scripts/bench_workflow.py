@@ -10,6 +10,10 @@ usage:
   with a "prompt" key. Keep the official template's models and settings.
 - Each configuration starts a new server with only its MONO_DECODE_XPU* variables set (inherited
   ones are removed; a launcher script may still set its own defaults: check `env` in the records).
+  Inherited MONO_TUNE_EVENTS / MONO_TUNE_PROFILE* apply to every configuration; set them in a
+  --config to apply them to one.
+- A run that does not finish within --run-timeout ends that configuration (its server is killed):
+  a kernel that cannot complete would otherwise wait forever.
   Run i sets the prompt-enhance sampling seed to seed_base + i; nothing else changes, so prompt
   enhance and everything after it re-execute while the loaders stay cached.
 - Run 0 is the first image after start; it is reported separately from the later runs, because the
@@ -25,6 +29,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import statistics
 import subprocess
 import sys
@@ -79,6 +84,22 @@ def api(base, path, data=None):
         return json.load(r)
 
 
+def port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def stop(srv):
+    try:
+        os.killpg(srv.pid, signal.SIGTERM)
+        srv.wait(timeout=90)
+    except ProcessLookupError:
+        pass
+    except subprocess.TimeoutExpired:
+        os.killpg(srv.pid, signal.SIGKILL)
+        srv.wait()
+
+
 def run_config(a, name, env_spec, prompt, pe_id):
     root = Path(a.out).resolve() / name  # the server runs in the ComfyUI directory
     for d in ("out", "user/__manager"):
@@ -88,16 +109,24 @@ def run_config(a, name, env_spec, prompt, pe_id):
     paths.write_text(f"mono_tune:\n  base_path: {HERE}\n  custom_nodes: nodes\n")  # the observer only
     gens = root / "gens.jsonl"
     gens.unlink(missing_ok=True)
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("MONO_DECODE_XPU", "MONO_TUNE"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MONO_DECODE_XPU") and k != "MONO_TUNE_OUT"}
     env.update(MONO_TUNE_OUT=str(gens))
     env.update(env_spec)
     port = str(a.port)
+    for _ in range(30):  # a previous server may still be releasing the port
+        if not port_in_use(a.port):
+            break
+        time.sleep(2)
+    else:
+        sys.exit(f"[{name}] port {port} is in use by another process: stop it or pass --port")
     launcher = shlex.split(a.launcher) if a.launcher else [a.python, "main.py"]
+    if os.path.exists(launcher[0]):  # the server runs in the ComfyUI directory
+        launcher[0] = os.path.abspath(launcher[0])
     cmd = launcher + ["--listen", "127.0.0.1", "--port", port, "--output-directory", str(root / "out"),
                       "--user-directory", str(root / "user"), "--disable-auto-launch",
                       "--extra-model-paths-config", str(paths)]
     for extra in a.extra_model_paths:
-        cmd += ["--extra-model-paths-config", extra]
+        cmd += ["--extra-model-paths-config", os.path.abspath(extra)]
     cmd += shlex.split(a.server_args)
     base = f"http://127.0.0.1:{port}"
     log = open(root / "server.log", "wb")
@@ -110,7 +139,8 @@ def run_config(a, name, env_spec, prompt, pe_id):
                 sys.exit(f"[{name}] server exited before ready; see {root / 'server.log'}")
             try:
                 api(base, "/system_stats")
-                break
+                if srv.poll() is None:  # answered by this server, not a leftover one
+                    break
             except OSError:
                 time.sleep(1)
         else:
@@ -129,9 +159,16 @@ def run_config(a, name, env_spec, prompt, pe_id):
                     hist = h[pid]
                 elif srv.poll() is not None:
                     sys.exit(f"[{name}] server died; see {root / 'server.log'}")
+                elif time.time() - t0 > a.run_timeout:
+                    break
                 else:
                     time.sleep(0.5)
             wall = time.time() - t0
+            if hist is None:
+                print(json.dumps(dict(config=name, run=i, status="timeout", wall_s=round(wall, 2))), flush=True)
+                runs.append(dict(config=name, run=i, kind="timeout", seed=seed, status="timeout",
+                                 wall_s=round(wall, 2), text_chars=0, generates=[]))
+                break
             recs = [json.loads(line) for line in list(open(gens))[before:]] if gens.exists() else []
             text = ""
             for out in (hist.get("outputs") or {}).values():
@@ -149,13 +186,7 @@ def run_config(a, name, env_spec, prompt, pe_id):
                              | {k: r.get(k) for k in ("tokens", "decode_tps", "tokens_per_step", "drafts_per_step",
                                                       "hit_max_length")}), flush=True)
     finally:
-        try:
-            os.killpg(srv.pid, signal.SIGTERM)
-            srv.wait(timeout=90)
-        except ProcessLookupError:
-            pass
-        except subprocess.TimeoutExpired:
-            os.killpg(srv.pid, signal.SIGKILL)
+        stop(srv)
     return runs
 
 
@@ -172,9 +203,14 @@ def summary(all_runs):
             return f"{vals[0]:.{nd}f}"
         return f"{statistics.mean(vals):.{nd}f} ({min(vals):.{nd}f}-{max(vals):.{nd}f})"
 
+    notes = []
     for config in dict.fromkeys(r["config"] for r in all_runs):
+        mine = [r for r in all_runs if r["config"] == config]
+        if not any(r["generates"] for r in mine):
+            notes.append(f"- {config}: no observer records (observer not loaded, or no MTP generate ran)")
+        notes += [f"- {config}: run {r['run']} {r['status']}" for r in mine if r["status"] != "success"]
         for kind in ("first", "measured"):
-            recs = [g for r in all_runs if r["config"] == config and r["kind"] == kind for g in r["generates"]]
+            recs = [g for r in mine if r["kind"] == kind for g in r["generates"]]
             if not recs:
                 continue
             seg = [g["device_segments_ms"] for g in recs if g.get("device_segments_ms")]
@@ -182,16 +218,16 @@ def summary(all_runs):
             layer = [g["stats"].get("layer", {}) for g in recs]
             layouts = sorted({str((x.get("weight_layout") or {}).get("layout")) for x in layer
                               if isinstance(x, dict) and isinstance(x.get("weight_layout"), dict)})
-            fb = {}
-            for x in layer:
-                if isinstance(x, dict):
-                    fb.update({k: v for k, v in (x.get("fallback") or {}).items() if v})
+            fb = {}  # per-generate deltas, summed over these runs
+            for g in recs:
+                for k, v in (g.get("fallbacks") or {}).items():
+                    fb[k] = fb.get(k, 0) + v
             rows.append(f"| {config} | {kind} x{len(recs)} | {fmt([g['decode_tps'] for g in recs])} | "
                         f"{fmt([g['tokens'] for g in recs], 0)} | {fmt([g['tokens_per_step'] for g in recs], 2)} | "
                         f"{fmt([g['drafts_per_step'] for g in recs], 2)} | {fmt([g['step_ms_mean'] for g in recs], 2)} | "
                         f"{segs} | {', '.join(layouts)} | {fb or '-'} | "
                         f"{sum(bool(g.get('hit_max_length')) for g in recs)} |")
-    return "\n".join(rows)
+    return "\n".join(rows + ([""] + notes if notes else []))
 
 
 def main():
@@ -214,6 +250,7 @@ def main():
     ap.add_argument("--extra-model-paths", action="append", default=[])
     ap.add_argument("--port", type=int, default=8288)
     ap.add_argument("--start-timeout", type=int, default=600)
+    ap.add_argument("--run-timeout", type=int, default=3600, help="seconds per run before the configuration is ended")
     a = ap.parse_args()
     a.warmup += 1  # run 0, the first image, is never part of the measured mean
 

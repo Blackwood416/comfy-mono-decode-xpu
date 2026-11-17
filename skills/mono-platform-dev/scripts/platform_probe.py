@@ -3,7 +3,8 @@
 usage: python platform_probe.py [--comfyui DIR] [--node DIR] [--device N] [--json OUT]
 
 Run it with the Python that runs ComfyUI. It reads device properties only; it launches no kernel
-and loads no model. Exit code 0 means no FAIL check.
+and loads no model. Exit code 0 means no FAIL check; a FAIL means the device breaks an assumption the
+kernels rely on.
 """
 import argparse
 import importlib.metadata as md
@@ -91,13 +92,17 @@ def main():
     rep["known"] = dict(zip(("product", "die", "aot_target", "status"), known)) if known else None
 
     # 1. Persistent kernels spin on a grid barrier, so every work-group must be resident at once.
-    #    The launch planner assumes 8 vector engines per Xe core (max_compute_units / 8 groups).
+    #    This mirrors resident_wgs() in csrc/mono_launch.hpp (max_compute_units / 8 work-groups);
+    #    update both together.
     cus, cores = dev["max_compute_units"], dev["gpu_subslice_count"]
     if cus and cores:
         planned = cus // 8
-        if planned != cores:
+        if planned > cores:
             check("FAIL", "co-residency", f"planner would launch {planned} work-groups on {cores} Xe cores "
-                  f"({cus // cores} EUs per core, expected 8): persistent kernels can deadlock")
+                  f"({cus // cores} EUs per core): more than can be resident, persistent kernels can deadlock")
+        elif planned < cores:
+            check("WARN", "co-residency", f"planner would launch {planned} work-groups on {cores} Xe cores: "
+                  "safe, but some cores stay idle")
         else:
             check("OK", "co-residency", f"{cores} Xe cores, one 1024-thread work-group each")
     # 2. One work-group is all 1024 hardware threads of an Xe core, in SIMD16 sub-groups.
@@ -128,10 +133,10 @@ def main():
               "and confirm nothing else runs on it")
     if known is None:
         check("WARN", "device", f"{dev.get('device_id_hex')} is not the validated device: establish "
-              "every assumption (reference/platform.md) before trusting a fast path")
+              "every assumption (references/platform.md) before trusting a fast path")
     # 6. Build state.
     if not built:
-        check("FAIL", "extension", "comfy_mono_decode_xpu/_C* not built: run `python install.py`")
+        check("WARN", "extension", "comfy_mono_decode_xpu/_C* not built yet: build it with `python install.py`")
     check("OK" if rep["packages"]["comfy-kitchen"] else "WARN", "kitchen",
           f"comfy-kitchen {rep['packages']['comfy-kitchen']}")
     return finish(rep, checks, a.json)

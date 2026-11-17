@@ -1,13 +1,14 @@
 """Decode observer for tuning runs (a ComfyUI custom node that adds no nodes).
 
 Wraps Qwen35.generate and appends one JSON line per MTP generate to $MONO_TUNE_OUT:
-tokens, verify steps, drafts, prefill and decode time, the effective MONO_DECODE_XPU* switches and
-the node's stats() after the generate. Off unless MONO_TUNE_OUT is set.
+tokens, verify steps, drafts, prefill and decode time, the effective MONO_DECODE_XPU* / MONO_TUNE*
+variables, every node module's stats() after the generate, and `fallbacks`: the fallback counters
+that grew during this generate (stats() counters are cumulative). Off unless MONO_TUNE_OUT is set.
 
 - MONO_TUNE_EVENTS=1: XPU events around each verify forward and the step's first draft give
   device-timed draft / verify / tail segments per step (the first quarter of the steps is skipped).
-- MONO_TUNE_PROFILE=N: an XPU-only torch profile of N verify steps, starting at step
-  MONO_TUNE_PROFILE_SKIP (default 16), written next to $MONO_TUNE_OUT as profile-<n>.json.
+- MONO_TUNE_PROFILE=N: an XPU-only torch profile of N verify steps, after the first
+  MONO_TUNE_PROFILE_SKIP (default 16) steps, written next to $MONO_TUNE_OUT as profile-<n>.json.
   Summarise it with profile_summary.py. Kernels replayed from an XPU graph do not appear in it.
 
 Load it through an extra model paths file whose `custom_nodes:` entry is the `nodes` directory;
@@ -28,23 +29,39 @@ NODE_CLASS_MAPPINGS = {}
 OUT = os.environ.get("MONO_TUNE_OUT")
 
 
-def _module(leaf):
-    return next((m for n, m in sys.modules.items() if n.endswith("comfy_mono_decode_xpu." + leaf)), None)
+def _node_modules():
+    """Every loaded module of the node's package, by its last name component."""
+    out = {}
+    for name, module in list(sys.modules.items()):
+        head, _, leaf = name.rpartition(".")
+        if module is not None and (head == "comfy_mono_decode_xpu" or head.endswith(".comfy_mono_decode_xpu")):
+            out.setdefault(leaf, module)
+    return out
 
 
 def _stats():
     out = {}
-    for leaf in ("layer", "autotree", "mtp_loop", "draft", "sampling", "logits", "patch", "mono"):
-        m = _module(leaf)
-        if m is not None and hasattr(m, "stats"):
+    for leaf, m in sorted(_node_modules().items()):
+        if callable(getattr(m, "stats", None)):
             try:
                 out[leaf] = m.stats()
             except Exception as e:  # noqa: BLE001 - diagnostics only
                 out[leaf] = f"stats() failed: {e}"
-    dl = _module("draft_lmhead")
+    dl = _node_modules().get("draft_lmhead")
     if dl is not None and hasattr(dl, "MODE"):
         out["draft_int4_mode"] = dl.MODE
     return out
+
+
+def _fallback_counts(stats):
+    counts = {}
+    for leaf, st in stats.items():
+        fb = st.get("fallback") if isinstance(st, dict) else None
+        if isinstance(fb, dict):
+            for reason, n in fb.items():
+                if isinstance(n, (int, float)):
+                    counts[f"{leaf}.{reason}"] = n
+    return counts
 
 
 if OUT:
@@ -83,7 +100,7 @@ if OUT:
                 return mf(*fa, **fk)
             ctr["verify"] += 1
             ctr["t"].append(time.perf_counter())
-            if prof_steps and ctr["verify"] == prof_skip:
+            if prof_steps and ctr["verify"] == prof_skip + 1:
                 ctr["prof"] = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.XPU])
                 ctr["prof"].__enter__()
             if events:
@@ -106,6 +123,7 @@ if OUT:
             note_draft()
             return mtp_f(*fa, **fk)
 
+        before = _fallback_counts(_stats())
         mtp_forward._mono_observer = True  # lets the fused draft head run (it skips unknown wrappers)
         mtp_forward._mono_on_draft = note_draft
         saved = [(obj, vars(obj).get("forward")) for obj in (self.model, self.mtp)]
@@ -133,9 +151,10 @@ if OUT:
                 key = {("d0", "v0"): "draft", ("v0", "v1"): "verify", ("v1", "d0"): "tail"}.get((ka, kb))
                 if key:
                     d[key].append(ea.elapsed_time(eb))
-            seg = {k: round(sum(v[len(v) // 4:]) / max(1, len(v) - len(v) // 4), 3) for k, v in d.items()}
+            seg = {k: round(sum(v[len(v) // 4:]) / (len(v) - len(v) // 4), 3) if v else None for k, v in d.items()}
         gaps = sorted(b - a for a, b in zip(st, st[1:]))
         n = len(ids)
+        stats = _stats()
         max_length = _argument(self, a, k, "max_length")
         rec = dict(
             generate=_count[0], mtp_arg=_argument(self, a, k, "mtp"), max_length=max_length, tokens=n,
@@ -149,8 +168,9 @@ if OUT:
             step_ms_mean=round(1000 * (st[-1] - st[0]) / (len(st) - 1), 3) if len(st) > 1 else None,
             step_ms_median=round(1000 * gaps[len(gaps) // 2], 3) if gaps else None,
             device_segments_ms=seg, profile=ctr["prof_file"],
-            env={key: v for key, v in os.environ.items() if key.startswith("MONO_DECODE_XPU")},
-            stats=_stats())
+            env={key: v for key, v in os.environ.items() if key.startswith(("MONO_DECODE_XPU", "MONO_TUNE"))},
+            stats=stats, fallbacks={key: v - before.get(key, 0) for key, v in _fallback_counts(stats).items()
+                                    if v - before.get(key, 0) > 0})
         with open(OUT, "a") as f:
             f.write(json.dumps(rec, default=str) + "\n")
         return ids

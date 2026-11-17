@@ -1,13 +1,15 @@
 ---
 name: mono-platform-dev
-description: Develop, port, bring up and tune comfy-mono-decode-xpu on an Intel GPU platform other than the one it was validated on (another card, architecture, driver, OS or ComfyUI / Torch stack). Covers checking the platform against the kernels' assumptions, building and testing, confirming which decode paths run, measuring decode against the bandwidth roof, and making platform-specific policy or kernel changes that keep the verify path exact. Use for any work on this node for new hardware or a new stack, or when it underperforms there.
+description: Use when developing, porting, bringing up or tuning comfy-mono-decode-xpu on an Intel GPU platform other than the one it was validated on (another card, architecture, driver, OS or ComfyUI / Torch stack), or when it underperforms there. Covers checking the platform against the kernels' assumptions, building and testing, confirming which decode paths run, measuring decode against the bandwidth roof, and making platform-specific policy or kernel changes that keep the verify path exact.
+license: Apache-2.0
 ---
 
 # Mono decode on another platform
 
-Plain Markdown and scripts; any coding agent, or a person, can follow it. Paths are relative to the
-repository root. Read `docs/DESIGN.md` (what each kernel does, the exactness boundary),
-`docs/ENV.md` (switches) and `tests/README.md` first.
+Plain Markdown and scripts; any coding agent, or a person, can follow it. Run commands from the
+repository root. `references/` and `scripts/` paths are relative to this file; `docs/`, `tests/` and
+`install.py` are at the repository root. Read `docs/DESIGN.md` (what each kernel does, the
+exactness boundary), `docs/ENV.md` (switches) and `tests/README.md` first.
 
 ## Principles
 
@@ -29,9 +31,9 @@ repository root. Read `docs/DESIGN.md` (what each kernel does, the exactness bou
 1. **Probe.**
    - Run `python skills/mono-platform-dev/scripts/platform_probe.py --comfyui <ComfyUI>` with
      ComfyUI's Python.
-   - Answer the remaining questions in `reference/platform.md`.
-   - A failed check means the fast paths must not run here until the code is ported. Keep the
-     node off with `MONO_DECODE_XPU=0`.
+   - Answer the remaining questions in `references/platform.md`.
+   - A FAIL means the device breaks an assumption the kernels rely on: the fast paths must not run
+     here until the code is ported. Keep the node off with `MONO_DECODE_XPU=0`.
 2. **Build and test.**
    - `python install.py --force [--target <aot>]`, then
      `PYTHONPATH=<ComfyUI> python -m pytest -q tests`, in ComfyUI's own environment.
@@ -42,17 +44,18 @@ repository root. Read `docs/DESIGN.md` (what each kernel does, the exactness bou
      why, and the weight layout of each generate.
    - Nothing may be silently disabled.
 4. **Measure.**
-   - Baseline with `scripts/bench_workflow.py`: stock against default, a fresh server each.
+   - Baseline with `scripts/bench_workflow.py`: stock against default, a fresh server each
+     (`--help` lists the options).
    - Measure the roof with `scripts/read_bandwidth.py`.
    - Locate the time with the observer's device segments and profile (`MONO_TUNE_EVENTS`,
      `MONO_TUNE_PROFILE`, then `scripts/profile_summary.py`).
-   - Follow `reference/methodology.md`.
+   - Follow `references/methodology.md`.
 5. **Change**, choosing by what steps 3–4 showed:
    - configuration (memory, experimental switches, MTP mode);
    - then host launch policy;
-   - then kernels or a port. See `reference/development.md`.
+   - then kernels or a port. See `references/development.md`.
 6. **Validate and report.**
-   - Acceptance as in `reference/methodology.md`.
+   - Acceptance as in `references/methodology.md`.
    - Report the platform (probe output, bandwidth), stack and commit, configurations, results
      for the first and later images, fallbacks, what was tried without effect, and which platforms
      a change was measured on.

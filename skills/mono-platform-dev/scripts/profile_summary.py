@@ -4,7 +4,7 @@ usage: python profile_summary.py PROFILE.json [--gdn-per-step 24] [--skip 1]
 
 Steps are delimited by every Nth Gated-DeltaNet layer kernel (Qwen3.5-9B: 24 per verify). Prints
 ms per step for each kernel family, the device idle per step and where the gaps fall. Compare the
-families with their bytes floor (reference/methodology.md). oneDNN GEMMs over 1 ms are the int8
+families with their bytes floor (references/methodology.md). oneDNN GEMMs over 1 ms are the int8
 lm_head; the MTP block GEMMs and the int4 draft lm_head land in "other gemm".
 """
 import argparse
