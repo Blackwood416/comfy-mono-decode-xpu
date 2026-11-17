@@ -14,8 +14,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-_HERE = Path(__file__).resolve()
-REPO = _HERE.parents[4] if len(_HERE.parents) > 4 else _HERE.parent  # .claude/skills/<skill>/scripts/ -> root
+# The checkout that contains this script (skills/<skill>/scripts/), else the script's directory.
+REPO = next((p for p in Path(__file__).resolve().parents if (p / "comfy_mono_decode_xpu").is_dir()),
+            Path(__file__).resolve().parent)
 
 # Device ids seen during development. Anything else is unvalidated, not unsupported.
 KNOWN = {
