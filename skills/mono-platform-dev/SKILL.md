@@ -90,6 +90,15 @@ cat bench/base/summary.md
 | `scripts/bench_workflow.py` | Replays an API-format workflow on fresh servers per configuration and summarizes decode per run. It loads the observer node `scripts/nodes/mono_tune_observer`, which writes per-generate records: tokens, steps, drafts, timings, stats and optional device segments and profile. | `--comfyui`, `--workflow`, `--out`, `--config NAME:VAR=V,...` (repeat), `--warmup`, `--runs`, `--pe-only`, `--mtp`, `--launcher`, `--server-args`, `--extra-model-paths`, `--run-timeout`; `--help` for all |
 | `scripts/profile_summary.py` | Per-step device time by kernel family, and idle time, from the observer's profile. | `PROFILE.json`, `--gdn-per-step`, `--skip` |
 
+## Troubleshooting
+
+| symptom | where to look |
+|---|---|
+| The server exits before it is ready | `<out>/<config>/server.log`: the launcher, model paths or port. |
+| "no observer records" in the summary | The observer did not load: a custom-node whitelist must include `mono_tune_observer`. Generates without MTP are not recorded. |
+| A run ends in `timeout` | Something on the device never completed. Read the server log, then bring the pieces up one at a time (`references/development.md`). |
+| The probe reports FAIL | The platform breaks a kernel assumption: keep `MONO_DECODE_XPU=0` and see `references/development.md`, Porting. |
+
 ## Limitations
 
 - Validated on one platform, the Arc Pro B70 (Xe2); everything else is to be established.

@@ -188,6 +188,7 @@ def run_config(a, name, env_spec, prompt, pe_id):
                                                       "hit_max_length")}), flush=True)
     finally:
         stop(srv)
+        log.close()
     return runs
 
 
