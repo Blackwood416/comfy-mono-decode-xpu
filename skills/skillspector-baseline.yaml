@@ -1,0 +1,26 @@
+# Audited SkillSpector exceptions for skills/mono-platform-dev (static scan, SkillSpector 2.13.4).
+# Kept outside the skill on purpose; pass it explicitly:
+#   skillevaluator tier1 skills/mono-platform-dev --no-llm --skillspector-baseline skills/skillspector-baseline.yaml
+version: 2
+rules:
+  - id: "E2"
+    path: "scripts/bench_workflow.py"
+    reason: "Reviewed: the benchmark starts ComfyUI with the caller's environment, minus the switches under test; nothing is logged or sent."
+  - id: "E2"
+    path: "scripts/nodes/mono_tune_observer/__init__.py"
+    reason: "Reviewed: records only MONO_DECODE_XPU* and MONO_TUNE* variables, into the local file the caller chose."
+  - id: "TT2"
+    path: "scripts/nodes/mono_tune_observer/__init__.py"
+    reason: "Reviewed: MONO_TUNE_OUT is the record file the caller chose; the observer appends JSON lines to it."
+  - id: "AST4"
+    path: "scripts/bench_workflow.py"
+    reason: "Reviewed: starts the caller's ComfyUI server from an argument list, without a shell."
+  - id: "AST4"
+    path: "scripts/platform_probe.py"
+    reason: "Reviewed: runs git describe on the node checkout from an argument list, without a shell."
+  - id: "AST7"
+    path: "scripts/platform_probe.py"
+    reason: "Reviewed: reads a fixed tuple of torch device property names."
+  - id: "LP3"
+    path: "SKILL.md"
+    reason: "Reviewed: no tool scope on purpose; allowed-tools changes delivery in some harnesses (Claude Code headless runs, Copilot CLI map form)."
