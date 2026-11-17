@@ -412,6 +412,7 @@ build_icpx.sh            the single-invocation icpx build
 pyproject.toml           Comfy Registry metadata
 THIRD_PARTY_NOTICES.md   third-party sources and licenses (full texts in licenses/)
 tests/                   no-model pytest unit tests; UI model-validation instructions
+.claude/skills/           agent skill for bringing up, benchmarking and tuning on another XPU
 ```
 
 ## Limits
@@ -427,7 +428,9 @@ tests/                   no-model pytest unit tests; UI model-validation instruc
 - Single XPU device per process.
 - Performance is validated on Arc Pro B70. Arc B580 (20 Xe cores; launches size themselves to the
   core count) has been checked functionally in a development environment. Other BMG cards run the
-  same `bmg` build untested; set `MONO_DECODE_XPU=0` if anything looks wrong.
+  same `bmg` build untested; set `MONO_DECODE_XPU=0` if anything looks wrong. To check, benchmark
+  and tune on another card, follow `.claude/skills/mono-platform-tuning/SKILL.md` (usable by any
+  coding agent or by hand).
 
 ## License
 
