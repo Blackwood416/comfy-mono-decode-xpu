@@ -2,7 +2,7 @@
 
 Wraps Qwen35.generate and appends one JSON line per MTP generate to $MONO_TUNE_OUT:
 tokens, verify steps, drafts, prefill and decode time, the effective MONO_DECODE_XPU* / MONO_TUNE*
-variables, every node module's stats() after the generate, and `fallbacks`: the fallback counters
+variables, the stats() of every node module after the generate, and `fallbacks`: the fallback counters
 that grew during this generate (stats() counters are cumulative). Off unless MONO_TUNE_OUT is set.
 
 - MONO_TUNE_EVENTS=1: XPU events around each verify forward and the step's first draft give

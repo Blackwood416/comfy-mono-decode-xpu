@@ -8,7 +8,7 @@ usage:
       [--launcher "CMD ..."] [--server-args "..."] [--extra-model-paths FILE] [--port 8288]
 
 - API.json: the workflow in API format (frontend: Export (API)), or a saved /prompt request body
-  with a "prompt" key. Keep the official template's models and settings.
+  with a "prompt" key. Keep the models and settings of the official template.
 - Each configuration starts a new server with only its MONO_DECODE_XPU* variables set (inherited
   ones are removed; a launcher script may still set its own defaults: check `env` in the records).
   Inherited MONO_TUNE_EVENTS / MONO_TUNE_PROFILE* apply to every configuration; set them in a
@@ -21,7 +21,7 @@ usage:
   memory state differs (for example whether the tile-major weight copy fits).
 - --pe-only keeps only the prompt-enhance node and what feeds it, plus a PreviewAny of its text.
 - --mtp pins the MTP tree (for example tree4s1m8) so configurations do identical work per step;
-  under `auto` the tree follows each configuration's measured speed.
+  under auto the tree follows the measured speed of each configuration.
 Writes OUT/<config>/{server.log,gens.jsonl,run-<i>.json,text-<i>.txt} and OUT/summary.md.
 """
 import argparse
