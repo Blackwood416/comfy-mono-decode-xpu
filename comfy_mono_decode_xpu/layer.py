@@ -247,7 +247,9 @@ def _same(a, b):
 def _norm_rope_eligible(mix, rawq, rawk, xv4, freqs, kv):
     from comfy.text_encoders import llama
     from torch.nn.modules import module
-    if (not _rope_fused or guard.off("norm_rope") or torch.is_grad_enabled()
+    if (not _rope_fused or guard.off("norm_rope")
+            or (torch.is_grad_enabled() and any(t.requires_grad for t in (
+                rawq, rawk, xv4, mix.q_norm.weight, mix.k_norm.weight)))
             or type(kv) is not llama.FixedKVCache or rawq.shape[0] != 1 or mix.head_dim != 256):
         return False
     if any((module._global_forward_hooks, module._global_forward_pre_hooks,

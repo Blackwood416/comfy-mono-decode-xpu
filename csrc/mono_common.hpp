@@ -123,6 +123,30 @@ inline void build_pair_table_global(sycl::nd_item<1>& it, uint16_t* gtab, const 
         gtab[i] = uint16_t(pair_code(cb[byte & 15], scale) | (pair_code(cb[byte >> 4], scale) << 8));
     }
 }
+inline void build_pair_table_global_cached(sycl::nd_item<1>& it, uint16_t* gtab, const float* cb, uint32_t wg, uint32_t nw) {
+    const int t = it.get_local_id(0);
+    const auto* meta = reinterpret_cast<const uint32_t*>(gtab + TAB);
+    const auto* cbu = reinterpret_cast<const uint32_t*>(cb);
+    bool hit = (meta[16] == 0xA55AA55Au);
+    if (hit && t < 16) hit = (meta[t] == cbu[t]);
+    if (sycl::all_of_group(it.get_group(), hit)) return;
+    if (wg == 0 && t == 0) reinterpret_cast<uint32_t*>(gtab + TAB)[16] = 0u;
+    for (int i = int(wg) * MWG + t; i < TAB; i += int(nw) * MWG) {
+        const int byte = i & 255;
+        const float scale = static_cast<float>(sycl::bit_cast<fp8>(uint8_t(i >> 8)));
+        gtab[i] = uint16_t(pair_code(cb[byte & 15], scale) | (pair_code(cb[byte >> 4], scale) << 8));
+    }
+}
+inline void commit_pair_table_tag(sycl::nd_item<1>& it, uint16_t* gtab, const float* cb) {
+    if (it.get_group(0) == 0 && it.get_local_id(0) < 17) {
+        auto* meta = reinterpret_cast<uint32_t*>(gtab + TAB);
+        if (meta[16] != 0xA55AA55Au) {
+            const int t = it.get_local_id(0);
+            if (t < 16) meta[t] = reinterpret_cast<const uint32_t*>(cb)[t];
+            else meta[16] = 0xA55AA55Au;
+        }
+    }
+}
 // SLM copy of the global table; the caller barriers before use
 inline void load_pair_table(sycl::nd_item<1>& it, LPtrU16 tab, const uint16_t* gtab) {
     const int t = it.get_local_id(0);
@@ -440,11 +464,11 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
 }
 
 #ifdef MONO_DECODE_XPU_DG2
-// DG2 high-bandwidth Split-8 MultiN-2 DPAS GEMV helpers (no register spill, no lacc atomics).
-// Launch geometry: nd_range<1>(tiles * 64, 64) with reqd_sub_group_size(8), SLM partials(1024).
+// DG2 high-bandwidth Split-8/16 MultiN-2 DPAS GEMV helpers (no register spill, no lacc atomics).
+// Launch geometry: nd_range<1>(tiles * Split * 8, Split * 8) with reqd_sub_group_size(8), SLM partials(Split * 128).
 // Each work-group computes 16 output columns (2 x 8-col DPAS tiles) for up to 8 rows, sharing
-// one joint_matrix A load across both 8-col tiles and accumulating across 8 K-split sub-groups.
-template <int VAR = 0, typename EmitFn>
+// one joint_matrix A load across both 8-col tiles and interleaving tab[] gathers before MADs.
+template <int VAR = 0, int Split = 8, typename EmitFn>
 inline void dpas_gemv_stream(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st, GPtrU16 tab,
                              sycl::multi_ptr<int32_t, sycl::access::address_space::local_space,
                                              sycl::access::decorated::no> partials,
@@ -464,7 +488,7 @@ inline void dpas_gemv_stream(sycl::nd_item<1>& it, const int8_t* xq, const Strea
     const bool tiled = st.tiled;
 
     jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> a;
-    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 8, jm::layout::ext_intel_packed> b;
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 8, jm::layout::ext_intel_packed> b[2];
     jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 8> c[2];
     jm::joint_matrix_fill(sg, c[0], 0);
     jm::joint_matrix_fill(sg, c[1], 0);
@@ -478,63 +502,73 @@ inline void dpas_gemv_stream(sycl::nd_item<1>& it, const int8_t* xq, const Strea
         pk.load(0, gptr(reinterpret_cast<const uint32_t*>(wq + off)));
         return pk;
     };
+    auto load_sc = [&](int hh, int k) {
+        const int64_t c16 = hh * 8 + lane;
+        const int64_t col = int64_t(tile) * 16 + c16;
+        const int64_t soff = tiled ? ((int64_t(tile) * (K >> 8) + (k >> 8)) * 16 + c16) * 16 + ((k >> 4) & 15)
+                                   : col * gpr + (k >> 4);
+        return *reinterpret_cast<const uint16_t*>(ws + soff);
+    };
 
     sycl::vec<uint32_t, 4> next[2];
+    uint16_t next_sc[2] = {0, 0};
     int k = split * 32;
     if (k < K) {
         next[0] = load_pk(0, k);
         next[1] = load_pk(1, k);
+        next_sc[0] = load_sc(0, k);
+        next_sc[1] = load_sc(1, k);
     }
-    for (; k < K; k += 256) {
-        const auto pk0 = next[0];
-        const auto pk1 = next[1];
-        const int nk = k + 256;
+    for (; k < K; k += Split * 32) {
+        const auto pk0 = next[0], pk1 = next[1];
+        const uint16_t sc0 = next_sc[0], sc1 = next_sc[1];
+        const int nk = k + Split * 32;
         if (nk < K) {
             next[0] = load_pk(0, nk);
             next[1] = load_pk(1, nk);
+            next_sc[0] = load_sc(0, nk);
+            next_sc[1] = load_sc(1, nk);
         }
         jm::joint_matrix_load(sg, a, gptr(xq + k), K);
+        uint32_t d[2][8];
 #pragma unroll
         for (int hh = 0; hh < 2; ++hh) {
             const auto& pk = hh == 0 ? pk0 : pk1;
-            const int64_t c16 = hh * 8 + lane;
-            const int64_t col = int64_t(tile) * 16 + c16;
-            const int64_t soff = tiled ? ((int64_t(tile) * (K >> 8) + (k >> 8)) * 16 + c16) * 16 + ((k >> 4) & 15)
-                                       : col * gpr + (k >> 4);
-            const uint32_t ba = uint32_t(sycl::bit_cast<uint8_t>(ws[soff])) << 8;
-            const uint32_t bb = uint32_t(sycl::bit_cast<uint8_t>(ws[soff + 1])) << 8;
-            uint32_t d[8];
+            const uint16_t sc16 = hh == 0 ? sc0 : sc1;
+            const uint32_t ba = (uint32_t(sc16) & 0xFFu) << 8;
+            const uint32_t bb = uint32_t(sc16) & 0xFF00u;
             if constexpr (VAR == 1) {
 #pragma unroll
-                for (int wi = 0; wi < 4; ++wi) { d[2 * wi] = pk[wi] ^ ba; d[2 * wi + 1] = pk[wi] ^ bb; }
+                for (int wi = 0; wi < 4; ++wi) { d[hh][2 * wi] = pk[wi] ^ ba; d[hh][2 * wi + 1] = pk[wi] ^ bb; }
             } else {
 #pragma unroll
                 for (int wi = 0; wi < 4; ++wi) {
                     const uint32_t word = pk[wi], base = wi < 2 ? ba : bb;
-                    d[2 * wi] = uint32_t(tab[base | (word & 0xFFu)]) | (uint32_t(tab[base | ((word >> 8) & 0xFFu)]) << 16);
-                    d[2 * wi + 1] = uint32_t(tab[base | ((word >> 16) & 0xFFu)]) | (uint32_t(tab[base | (word >> 24)]) << 16);
+                    d[hh][2 * wi] = uint32_t(tab[base | (word & 0xFFu)]) | (uint32_t(tab[base | ((word >> 8) & 0xFFu)]) << 16);
+                    d[hh][2 * wi + 1] = uint32_t(tab[base | ((word >> 16) & 0xFFu)]) | (uint32_t(tab[base | (word >> 24)]) << 16);
                 }
             }
-            {
-                auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, b);
+        }
 #pragma unroll
-                for (int i = 0; i < 32; ++i)
-                    wd[i] = static_cast<int8_t>((d[i >> 2] >> (8 * (i & 3))) & 0xFF);
-            }
-            jm::joint_matrix_mad(sg, c[hh], a, b, c[hh]);
+        for (int hh = 0; hh < 2; ++hh) {
+            auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, b[hh]);
+#pragma unroll
+            for (int i = 0; i < 32; ++i)
+                wd[i] = static_cast<int8_t>((d[hh][i >> 2] >> (8 * (i & 3))) & 0xFF);
+            jm::joint_matrix_mad(sg, c[hh], a, b[hh], c[hh]);
         }
     }
     jm::joint_matrix_store(sg, c[0], partials + (split * 2 + 0) * 64, 8, jm::layout::row_major);
     jm::joint_matrix_store(sg, c[1], partials + (split * 2 + 1) * 64, 8, jm::layout::row_major);
     sycl::group_barrier(it.get_group());
-    for (int i = tid; i < 128; i += 64) {
+    for (int i = tid; i < 128; i += Split * 8) {
         const int r = i >> 4;
         if (r >= R) continue;
         const int coff = i & 15, hh = coff >> 3, l = coff & 7;
         const int64_t n = int64_t(tile) * 16 + coff;
         uint32_t sum = 0;
 #pragma unroll
-        for (int s = 0; s < 8; ++s) sum += static_cast<uint32_t>(partials[(s * 2 + hh) * 64 + r * 8 + l]);
+        for (int s = 0; s < Split; ++s) sum += static_cast<uint32_t>(partials[(s * 2 + hh) * 64 + r * 8 + l]);
         emit(m, r, n, sycl::bit_cast<int32_t>(sum));
     }
 }
@@ -558,7 +592,7 @@ inline void dpas_gemv_pair(sycl::nd_item<1>& it, const int8_t* xq, const W4& G, 
     const int gpr = K >> 4;
 
     jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> a;
-    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 8, jm::layout::ext_intel_packed> b;
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 8, jm::layout::ext_intel_packed> b[2];
     jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 8> c[2];
     jm::joint_matrix_fill(sg, c[0], 0);
     jm::joint_matrix_fill(sg, c[1], 0);
@@ -570,49 +604,58 @@ inline void dpas_gemv_pair(sycl::nd_item<1>& it, const int8_t* xq, const W4& G, 
         pk.load(0, gptr(reinterpret_cast<const uint32_t*>(wq + off)));
         return pk;
     };
+    auto load_sc = [&](const fp8* ws, int k) {
+        const int64_t soff = tiled ? ((t16 * (K >> 8) + (k >> 8)) * 16 + c16) * 16 + ((k >> 4) & 15)
+                                   : col * gpr + (k >> 4);
+        return *reinterpret_cast<const uint16_t*>(ws + soff);
+    };
 
     sycl::vec<uint32_t, 4> next[2];
+    uint16_t next_sc[2] = {0, 0};
     int k = split * 32;
     if (k < K) {
         next[0] = load_pk(G.q, k);
         next[1] = load_pk(U.q, k);
+        next_sc[0] = load_sc(G.s, k);
+        next_sc[1] = load_sc(U.s, k);
     }
     for (; k < K; k += 256) {
-        const auto pk0 = next[0];
-        const auto pk1 = next[1];
+        const auto pk0 = next[0], pk1 = next[1];
+        const uint16_t sc0 = next_sc[0], sc1 = next_sc[1];
         const int nk = k + 256;
         if (nk < K) {
             next[0] = load_pk(G.q, nk);
             next[1] = load_pk(U.q, nk);
+            next_sc[0] = load_sc(G.s, nk);
+            next_sc[1] = load_sc(U.s, nk);
         }
         jm::joint_matrix_load(sg, a, gptr(xq + k), K);
+        uint32_t d[2][8];
 #pragma unroll
         for (int hh = 0; hh < 2; ++hh) {
             const auto& pk = hh == 0 ? pk0 : pk1;
-            const fp8* ws = hh == 0 ? G.s : U.s;
-            const int64_t soff = tiled ? ((t16 * (K >> 8) + (k >> 8)) * 16 + c16) * 16 + ((k >> 4) & 15)
-                                       : col * gpr + (k >> 4);
-            const uint32_t ba = uint32_t(sycl::bit_cast<uint8_t>(ws[soff])) << 8;
-            const uint32_t bb = uint32_t(sycl::bit_cast<uint8_t>(ws[soff + 1])) << 8;
-            uint32_t d[8];
+            const uint16_t sc16 = hh == 0 ? sc0 : sc1;
+            const uint32_t ba = (uint32_t(sc16) & 0xFFu) << 8;
+            const uint32_t bb = uint32_t(sc16) & 0xFF00u;
             if constexpr (VAR == 1) {
 #pragma unroll
-                for (int wi = 0; wi < 4; ++wi) { d[2 * wi] = pk[wi] ^ ba; d[2 * wi + 1] = pk[wi] ^ bb; }
+                for (int wi = 0; wi < 4; ++wi) { d[hh][2 * wi] = pk[wi] ^ ba; d[hh][2 * wi + 1] = pk[wi] ^ bb; }
             } else {
 #pragma unroll
                 for (int wi = 0; wi < 4; ++wi) {
                     const uint32_t word = pk[wi], base = wi < 2 ? ba : bb;
-                    d[2 * wi] = uint32_t(tab[base | (word & 0xFFu)]) | (uint32_t(tab[base | ((word >> 8) & 0xFFu)]) << 16);
-                    d[2 * wi + 1] = uint32_t(tab[base | ((word >> 16) & 0xFFu)]) | (uint32_t(tab[base | (word >> 24)]) << 16);
+                    d[hh][2 * wi] = uint32_t(tab[base | (word & 0xFFu)]) | (uint32_t(tab[base | ((word >> 8) & 0xFFu)]) << 16);
+                    d[hh][2 * wi + 1] = uint32_t(tab[base | ((word >> 16) & 0xFFu)]) | (uint32_t(tab[base | (word >> 24)]) << 16);
                 }
             }
-            {
-                auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, b);
+        }
 #pragma unroll
-                for (int i = 0; i < 32; ++i)
-                    wd[i] = static_cast<int8_t>((d[i >> 2] >> (8 * (i & 3))) & 0xFF);
-            }
-            jm::joint_matrix_mad(sg, c[hh], a, b, c[hh]);
+        for (int hh = 0; hh < 2; ++hh) {
+            auto wd = sycl::ext::oneapi::detail::get_wi_data(sg, b[hh]);
+#pragma unroll
+            for (int i = 0; i < 32; ++i)
+                wd[i] = static_cast<int8_t>((d[hh][i >> 2] >> (8 * (i & 3))) & 0xFF);
+            jm::joint_matrix_mad(sg, c[hh], a, b[hh], c[hh]);
         }
     }
     jm::joint_matrix_store(sg, c[0], partials + (split * 2 + 0) * 64, 8, jm::layout::row_major);

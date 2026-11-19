@@ -32,12 +32,10 @@ inline float norm_sum32(sycl::sub_group sg, float lo, float hi) {
 }
 
 inline float norm_hw_rsqrt(float x) {
-#if defined(__SYCL_DEVICE_ONLY__) && !defined(MONO_DECODE_XPU_DG2)
+#ifdef __SYCL_DEVICE_ONLY__
     float result;
     __asm__ volatile("rsqrt (M1, 16) %0(0,0)<1> %1(0,0)<1;1,0>" : "=rw"(result) : "rw"(x));
     return result;
-#elif defined(__SYCL_DEVICE_ONLY__)
-    return sycl::native::rsqrt(x);
 #else
     return sycl::rsqrt(x);
 #endif
@@ -205,37 +203,19 @@ std::vector<torch::Tensor> qk_norm_rope_kv(
                         if (lane == 0) sums[sgi] = sum;
                     }
                 } else {
-#ifdef MONO_DECODE_XPU_DG2
-                    if (sgi < 4) {
-                        const float x0 = static_cast<float>(src[sgi * 64 + lane]);
-                        const float x1 = static_cast<float>(src[sgi * 64 + lane + 16]);
-                        const float x2 = static_cast<float>(src[sgi * 64 + lane + 32]);
-                        const float x3 = static_cast<float>(src[sgi * 64 + lane + 48]);
-                        const float sum = norm_sum32(sg, x0 * x0 + x2 * x2, x1 * x1 + x3 * x3) * (1.f / 256.f);
-                        if (lane == 0) sums[sgi] = sum;
-                    }
-#else
                     const float a = static_cast<float>(src[sgi * 32 + lane]);
                     const float b = static_cast<float>(src[sgi * 32 + lane + 16]);
                     const float sum = norm_sum32(sg, a * a, b * b) * (1.f / 256.f);
                     if (lane == 0) sums[sgi] = sum;
-#endif
                 }
                 sycl::group_barrier(it.get_group());
                 if (torch_norm && sgi == 0 && lane == 0)
                     sums[8] = sycl::rsqrt((sums[0] + sums[1]) * (1.f / 256.f) + eq);
                 if (!torch_norm && sgi == 0) {
-#ifdef MONO_DECODE_XPU_DG2
-                    float sum = lane < 4 ? sums[lane] : 0.f;
-                    for (int offset = 2; offset; offset /= 2)
-                        sum = sum + sycl::shift_group_left(sg, sum, offset);
-                    if (lane == 0) sums[8] = norm_hw_rsqrt(sum + (isq ? eq : ek));
-#else
                     float sum = lane < 8 ? sums[lane] : 0.f;
                     for (int offset = 4; offset; offset /= 2)
                         sum = sum + sycl::shift_group_left(sg, sum, offset);
                     if (lane == 0) sums[8] = norm_hw_rsqrt(sum + (isq ? eq : ek));
-#endif
                 }
                 sycl::group_barrier(it.get_group());
                 const float scale = sums[8];
