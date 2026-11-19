@@ -108,6 +108,7 @@ std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, doub
     Stream st = make_stream(ws, nm, false);
     st.tiled = tiled;
     const int64_t accumulator_elements = plan_streams(queue, NW, {&st}, STREAM_SLM + NORM_SLM);
+    (void)accumulator_elements;
     const auto* xp = reinterpret_cast<const bf16*>(x.data_ptr());
     const auto* wp = reinterpret_cast<const bf16*>(norm_w.data_ptr());
     const auto* hp = reinterpret_cast<const bf16*>(hadamard.data_ptr());
@@ -135,29 +136,16 @@ std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, doub
             });
     });
     queue.submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<int32_t, 1> acc(accumulator_elements, cgh);
+        sycl::local_accessor<int32_t, 1> partials(1024, cgh);
         cgh.parallel_for<LayerPrePhase2K>(
-            sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                const int t = it.get_local_id(0);
-                const uint32_t wg = it.get_group(0);
-                auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
-                int64_t t0, t1;
-                stream_range(st, wg, NW, t0, t1);
-                for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) lacc[i] = 0;
-                sycl::group_barrier(it.get_group());
-                stream_gemv(it, q1p, st, t0, t1, tab, lacc);
-                sycl::group_barrier(it.get_group());
-                for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
-                    const int e2 = i % 128, r = e2 / 16;
-                    if (r >= R) continue;
-                    int tile;
-                    const int m = stream_which(st, int(t0 + i / 128), tile);
-                    const int64_t n = int64_t(tile) * 16 + e2 % 16;
+            sycl::nd_range<1>(st.tiles * 64, 64), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                auto p = lptr(partials.template get_multi_ptr<sycl::access::decorated::no>().get());
+                dpas_gemv_stream(it, q1p, st, tab, p, R, [&](int m, int r, int64_t n, int32_t sum) {
                     const float* scm = m == 0 ? st.m[0].sc : (m == 1 ? st.m[1].sc : st.m[2].sc);
                     const int64_t N = m == 0 ? st.m[0].n : (m == 1 ? st.m[1].n : st.m[2].n);
                     bf16* o = m == 0 ? o0 : (m == 1 ? o1 : o2);
-                    o[r * N + n] = scaleback(lacc[i], sp[r], scm[n]);
-                }
+                    o[r * N + n] = scaleback(sum, sp[r], scm[n]);
+                });
             });
     });
 #else
@@ -244,6 +232,7 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     SG.cyclic = tiled && (SG.tiles / 2) % NW == 0;
     SD.cyclic = tiled && SD.tiles % NW == 0;
     const int64_t accumulator_elements = plan_streams(queue, NW, {&SO, &SG, &SD}, STREAM_SLM + NORM_SLM);
+    (void)accumulator_elements;
     const int64_t N1 = G.n;
     const bool ginter = gate && gate->numel() == R * 8192;
     auto* xp = reinterpret_cast<bf16*>(x.data_ptr());
@@ -291,25 +280,13 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     });
     if (ST >= 2) {
         queue.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<int32_t, 1> acc(accumulator_elements, cgh);
+            sycl::local_accessor<int32_t, 1> partials(1024, cgh);
             cgh.parallel_for<LayerPostPhase2K<CompactH>>(
-                sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                    const int t = it.get_local_id(0);
-                    const uint32_t wg = it.get_group(0);
-                    auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
-                    int64_t t0, t1;
-                    stream_range(SO, wg, NW, t0, t1);
-                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) lacc[i] = 0;
-                    sycl::group_barrier(it.get_group());
-                    stream_gemv(it, q1p, SO, t0, t1, tab, lacc);
-                    sycl::group_barrier(it.get_group());
-                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
-                        const int e2 = i % 128, r = e2 / 16;
-                        if (r >= R) continue;
-                        const int64_t tile = i / 128;
-                        const int64_t n = (SO.cyclic ? tile * NW + wg : t0 + tile) * 16 + e2 % 16;
-                        x1p[r * 4096 + n] = bf16_add(xp[r * 4096 + n], scaleback(lacc[i], sp[r], O.sc[n]));
-                    }
+                sycl::nd_range<1>(SO.tiles * 64, 64), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                    auto p = lptr(partials.template get_multi_ptr<sycl::access::decorated::no>().get());
+                    dpas_gemv_stream(it, q1p, SO, tab, p, R, [&](int, int r, int64_t n, int32_t sum) {
+                        x1p[r * 4096 + n] = bf16_add(xp[r * 4096 + n], scaleback(sum, sp[r], O.sc[n]));
+                    });
                 });
         });
     }
@@ -330,27 +307,15 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     }
     if (ST >= 4) {
         queue.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<int32_t, 1> acc(accumulator_elements, cgh);
+            sycl::local_accessor<int32_t, 1> partials(1024, cgh);
             cgh.parallel_for<LayerPostPhase4K<CompactH>>(
-                sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                    const int t = it.get_local_id(0);
-                    const uint32_t wg = it.get_group(0);
-                    auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
-                    int64_t t0, t1;
-                    stream_range(SG, wg, NW, t0, t1);
-                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) lacc[i] = 0;
-                    sycl::group_barrier(it.get_group());
-                    stream_gemv(it, q1p, SG, t0, t1, tab, lacc);
-                    sycl::group_barrier(it.get_group());
-                    for (int64_t i = t; i < (t1 - t0) / 2 * 128; i += MWG) {
-                        const int64_t tl = i / 128;
-                        const int e2 = i % 128, r = e2 / 16;
-                        if (r >= R) continue;
-                        const int64_t n = (SG.cyclic ? tl * NW + wg : t0 / 2 + tl) * 16 + e2 % 16;
-                        const bf16 g = scaleback(lacc[(2 * tl) * 128 + e2], sp[8 + r], G.sc[n]);
-                        const bf16 u = scaleback(lacc[(2 * tl + 1) * 128 + e2], sp[8 + r], U.sc[n]);
+                sycl::nd_range<1>((N1 / 8) * 64, 64), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                    auto p = lptr(partials.template get_multi_ptr<sycl::access::decorated::no>().get());
+                    dpas_gemv_pair(it, q1p, G, U, tiled, tab, p, R, [&](int r, int64_t n, int32_t sg_sum, int32_t su_sum) {
+                        const bf16 g = scaleback(sg_sum, sp[8 + r], G.sc[n]);
+                        const bf16 u = scaleback(su_sum, sp[8 + r], U.sc[n]);
                         hb[r * N1 + n] = bf16_mul(lut[sycl::bit_cast<uint16_t>(g)], u);
-                    }
+                    });
                 });
         });
     }
@@ -368,25 +333,13 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     }
     if (ST >= 6) {
         queue.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<int32_t, 1> acc(accumulator_elements, cgh);
+            sycl::local_accessor<int32_t, 1> partials(1024, cgh);
             cgh.parallel_for<LayerPostPhase6K<CompactH>>(
-                sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                    const int t = it.get_local_id(0);
-                    const uint32_t wg = it.get_group(0);
-                    auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
-                    int64_t t0, t1;
-                    stream_range(SD, wg, NW, t0, t1);
-                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) lacc[i] = 0;
-                    sycl::group_barrier(it.get_group());
-                    stream_gemv(it, q2p, SD, t0, t1, tab, lacc);
-                    sycl::group_barrier(it.get_group());
-                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
-                        const int e2 = i % 128, r = e2 / 16;
-                        if (r >= R) continue;
-                        const int64_t tile = i / 128;
-                        const int64_t n = (SD.cyclic ? tile * NW + wg : t0 + tile) * 16 + e2 % 16;
-                        xp[r * 4096 + n] = bf16_add(x1p[r * 4096 + n], scaleback(lacc[i], sp[16 + r], D.sc[n]));
-                    }
+                sycl::nd_range<1>(SD.tiles * 64, 64), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                    auto p = lptr(partials.template get_multi_ptr<sycl::access::decorated::no>().get());
+                    dpas_gemv_stream(it, q2p, SD, tab, p, R, [&](int, int r, int64_t n, int32_t sum) {
+                        xp[r * 4096 + n] = bf16_add(x1p[r * 4096 + n], scaleback(sum, sp[16 + r], D.sc[n]));
+                    });
                 });
         });
     }

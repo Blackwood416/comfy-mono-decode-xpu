@@ -110,34 +110,23 @@ torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor s
     });
     if (ST >= 2) {
         queue.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<int32_t, 1> acc(accumulator_elements, cgh);
+            sycl::local_accessor<int32_t, 1> partials(1024, cgh);
             cgh.parallel_for<MlpPhase2GateUpK>(
-                sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                    const int t = it.get_local_id(0);
-                    const uint32_t wg = it.get_group(0);
-                    auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
-                    int64_t t0, t1;
-                    stream_range(SG, wg, NW, t0, t1);
-                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) lacc[i] = 0;
-                    sycl::group_barrier(it.get_group());
-                    if (VARIANT == 1) stream_gemv<1>(it, q1p, SG, t0, t1, tab, lacc);
-                    else stream_gemv(it, q1p, SG, t0, t1, tab, lacc);
-                    sycl::group_barrier(it.get_group());
-                    for (int64_t i = t; i < (t1 - t0) / 2 * 128; i += MWG) {
-                        const int64_t tl = i / 128;
-                        const int e = i % 128, r = e / 16;
-                        if (r >= R) continue;
-                        const int64_t n = (t0 / 2 + tl) * 16 + e % 16;
-                        float fg = static_cast<float>(lacc[(2 * tl) * 128 + e]);
+                sycl::nd_range<1>((N1 / 8) * 64, 64), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                    auto p = lptr(partials.template get_multi_ptr<sycl::access::decorated::no>().get());
+                    auto emit = [&](int r, int64_t n, int32_t sg_sum, int32_t su_sum) {
+                        float fg = static_cast<float>(sg_sum);
                         fg = fg * sp[r];
                         fg = fg * G.sc[n];
-                        float fu = static_cast<float>(lacc[(2 * tl + 1) * 128 + e]);
+                        float fu = static_cast<float>(su_sum);
                         fu = fu * sp[r];
                         fu = fu * U.sc[n];
                         const bf16 g = static_cast<bf16>(fg);
                         const float act = static_cast<float>(lut[sycl::bit_cast<uint16_t>(g)]);
                         hb[r * N1 + n] = static_cast<bf16>(act * static_cast<float>(static_cast<bf16>(fu)));
-                    }
+                    };
+                    if (VARIANT == 1) dpas_gemv_pair<1>(it, q1p, G, U, tiled, tab, p, R, emit);
+                    else dpas_gemv_pair<0>(it, q1p, G, U, tiled, tab, p, R, emit);
                 });
         });
     }
@@ -155,32 +144,22 @@ torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor s
     }
     if (ST >= 4) {
         queue.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<int32_t, 1> acc(accumulator_elements, cgh);
+            sycl::local_accessor<int32_t, 1> partials(1024, cgh);
             cgh.parallel_for<MlpPhase4DownK>(
-                sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
-                    const int t = it.get_local_id(0);
-                    const uint32_t wg = it.get_group(0);
-                    auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
-                    int64_t t0, t1;
-                    stream_range(SD, wg, NW, t0, t1);
-                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) lacc[i] = 0;
-                    sycl::group_barrier(it.get_group());
-                    if (VARIANT == 1) stream_gemv<1>(it, q2p, SD, t0, t1, tab, lacc);
-                    else stream_gemv(it, q2p, SD, t0, t1, tab, lacc);
-                    sycl::group_barrier(it.get_group());
-                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
-                        const int64_t tl = i / 128;
-                        const int e = i % 128, r = e / 16;
-                        if (r >= R) continue;
-                        const int64_t n = (t0 + tl) * 16 + e % 16;
-                        float f = static_cast<float>(lacc[tl * 128 + e]);
+                sycl::nd_range<1>(SD.tiles * 64, 64), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SZ)]] {
+                    auto p = lptr(partials.template get_multi_ptr<sycl::access::decorated::no>().get());
+                    auto emit = [&](int, int r, int64_t n, int32_t sum) {
+                        float f = static_cast<float>(sum);
                         f = f * sp[8 + r];
                         f = f * D.sc[n];
                         op[r * N2 + n] = static_cast<bf16>(f);
-                    }
+                    };
+                    if (VARIANT == 1) dpas_gemv_stream<1>(it, q2p, SD, tab, p, R, emit);
+                    else dpas_gemv_stream<0>(it, q2p, SD, tab, p, R, emit);
                 });
         });
     }
+    (void)accumulator_elements; (void)cnt; (void)dbg;
 #else
     const int64_t accumulator_elements = plan_streams(queue, NW, {&SG, &SD}, STREAM_SLM + 16 * sizeof(float));  // + codebook
     queue.submit([&](sycl::handler& cgh) {

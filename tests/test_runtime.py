@@ -180,6 +180,7 @@ def test_reclaimable_pages_do_not_override_model_capacity(monkeypatch):
     monkeypatch.setattr(tiles, "_inactive_vram_budget", lambda device: 10000)
     monkeypatch.setattr(tiles, "_margin", 64)
     monkeypatch.setattr(torch.xpu, "memory_reserved", lambda device: 100)
+    monkeypatch.setattr(torch.xpu, "memory_allocated", lambda device: 100)
     monkeypatch.setattr(torch.xpu, "mem_get_info", lambda device: (0, 1024))
     props = types.SimpleNamespace(total_memory=1024)
     monkeypatch.setattr(torch.xpu, "get_device_properties", lambda device: props)

@@ -10,7 +10,9 @@
 // row scale, then by the channel scale) followed by a single output cast, so a
 // fused call is bit-identical to mm_w4a8 -> fused_scaleback -> .to(dtype).
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <utility>
 
 #include <c10/xpu/XPUStream.h>
 #include <sycl/ext/oneapi/bfloat16.hpp>
@@ -185,7 +187,7 @@ constexpr int kDpasN = 16;
 
 template <typename Scale, typename Out, bool FAST, int Split>
 void launch_dpas(const int8_t* x, const float* xs, const int8_t* w, const Scale* srel, const float* sch,
-                 const float* codebook, const Out* residual, Out* out, int64_t N, int64_t K, int64_t G,
+                 const float* codebook, const Out* residual, Out* out, int64_t M, int64_t N, int64_t K, int64_t G,
                  sycl::queue& q) {
     const int64_t tiles = (N + kDpasN - 1) / kDpasN;
     const int64_t groups_per_row = K / G;
@@ -259,7 +261,7 @@ void launch_dpas(const int8_t* x, const float* xs, const int8_t* w, const Scale*
                     for (int t = 0; t < Split; ++t) sum += static_cast<uint32_t>(partials[t * (8 * kDpasN) + i]);
                     const int r = i / kDpasN;
                     const int64_t n = it.get_group(0) * kDpasN + i % kDpasN;
-                    if (n < N) {
+                    if (r < M && n < N) {
                         float f = static_cast<float>(sycl::bit_cast<int32_t>(sum));
                         f = f * xs[r];
                         f = f * sch[n];
@@ -282,8 +284,24 @@ void dispatch(const torch::Tensor& x, const torch::Tensor& xs, const torch::Tens
               torch::Tensor& out, int64_t G, int64_t cfg, bool fast) {
     auto& q = c10::xpu::getCurrentXPUStream().queue();
     const int64_t rows = x.size(0), K = x.size(1), N = w.size(0);
-    // cfg 0: automatic; 100+S: DPAS with Split S (rows == 8); otherwise COLS + 10 * KS.
+    // cfg 0: automatic; 100+S: DPAS with Split S; otherwise COLS + 10 * KS.
+#ifdef MONO_DECODE_XPU_DG2
+    if (rows >= 1 && rows <= 8 && K % 32 == 0 && (cfg == 0 || cfg >= 100)) {
+        const int8_t* xp = x.data_ptr<int8_t>();
+        if (rows < 8) {
+            static std::map<std::pair<int, int64_t>, torch::Tensor> pad_cache;
+            auto key = std::make_pair(static_cast<int>(x.get_device()), K);
+            auto it = pad_cache.find(key);
+            if (it == pad_cache.end()) {
+                it = pad_cache.emplace(key, torch::zeros({8, K}, x.options())).first;
+            }
+            xp = it->second.data_ptr<int8_t>();
+            q.memcpy(const_cast<int8_t*>(xp), x.data_ptr<int8_t>(), static_cast<size_t>(rows * K));
+        }
+#else
     if (rows == 8 && K % 32 == 0 && (cfg == 0 || cfg >= 100)) {
+        const int8_t* xp = x.data_ptr<int8_t>();
+#endif
         int64_t split = cfg >= 100 ? cfg - 100 : 0;
         if (split == 0) {
             const auto units = q.get_device().get_info<sycl::info::device::max_compute_units>();
@@ -292,13 +310,13 @@ void dispatch(const torch::Tensor& x, const torch::Tensor& xs, const torch::Tens
         auto go = [&](auto s) {
             constexpr int S = decltype(s)::value;
             if (fast)
-                launch_dpas<Scale, Out, true, S>(x.data_ptr<int8_t>(), xs.data_ptr<float>(), w.data_ptr<int8_t>(),
+                launch_dpas<Scale, Out, true, S>(xp, xs.data_ptr<float>(), w.data_ptr<int8_t>(),
                                                  srel.data_ptr<Scale>(), sch.data_ptr<float>(), cb, res,
-                                                 static_cast<Out*>(out.data_ptr()), N, K, G, q);
+                                                 static_cast<Out*>(out.data_ptr()), rows, N, K, G, q);
             else
-                launch_dpas<Scale, Out, false, S>(x.data_ptr<int8_t>(), xs.data_ptr<float>(), w.data_ptr<int8_t>(),
+                launch_dpas<Scale, Out, false, S>(xp, xs.data_ptr<float>(), w.data_ptr<int8_t>(),
                                                   srel.data_ptr<Scale>(), sch.data_ptr<float>(), cb, res,
-                                                  static_cast<Out*>(out.data_ptr()), N, K, G, q);
+                                                  static_cast<Out*>(out.data_ptr()), rows, N, K, G, q);
         };
         if (split >= 16) go(std::integral_constant<int, 16>{});
         else if (split >= 8) go(std::integral_constant<int, 8>{});

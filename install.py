@@ -25,7 +25,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 SO = os.path.join(HERE, "comfy_mono_decode_xpu", "_C" + (sysconfig.get_config_var("EXT_SUFFIX") or (".pyd" if sys.platform == "win32" else ".so")))
 PREBUILT_REPO = os.environ.get("MONO_DECODE_XPU_PREBUILT_REPO", "Blackwood416/comfy-mono-decode-xpu")
-PREBUILT_TAG = os.environ.get("MONO_DECODE_XPU_PREBUILT_TAG", "v0.1.0+torch215.dg2.1")
+PREBUILT_TAG = os.environ.get("MONO_DECODE_XPU_PREBUILT_TAG", "v0.1.0+torch215.dg2.2")
 
 
 def log(msg):
